@@ -1,0 +1,108 @@
+# jdix-controller: the only component that binds a Pod to a Sandbox.
+#
+# One replica with leader election. The bind uses optimistic concurrency so more
+# would be safe, but a single active writer keeps the system easy to reason
+# about, and at this scale one is plenty.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: jdix-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: jdix-controller
+  namespace: jdix-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: jdix-controller
+subjects:
+  - kind: ServiceAccount
+    name: jdix-controller
+    namespace: jdix-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: jdix-controller
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: jdix-leader-election
+  namespace: jdix-system
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: jdix-leader-election
+  namespace: jdix-system
+subjects:
+  - kind: ServiceAccount
+    name: jdix-controller
+    namespace: jdix-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: jdix-leader-election
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jdix-controller
+  namespace: jdix-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: jdix-controller }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: jdix-controller }
+    spec:
+      serviceAccountName: jdix-controller
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: manager
+          image: registry.internal/jdix/controller:dev
+          args:
+            - --platform-image=registry.internal/jdix/sandbox-base:dev
+            - --control-token-file=/var/run/jdix/control-token
+            - --endpoint-suffix=sbx.example.com
+            - --allowed-registries=registry.internal
+            - --leader-elect
+          ports:
+            - { name: metrics, containerPort: 8080 }
+            - { name: health, containerPort: 8081 }
+          livenessProbe:
+            httpGet: { path: /healthz, port: health }
+            initialDelaySeconds: 15
+          readinessProbe:
+            httpGet: { path: /readyz, port: health }
+            initialDelaySeconds: 5
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: "1", memory: 512Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - name: control-token
+              mountPath: /var/run/jdix
+              readOnly: true
+      volumes:
+        - name: control-token
+          secret:
+            secretName: jdix-control-token
+            defaultMode: 0400

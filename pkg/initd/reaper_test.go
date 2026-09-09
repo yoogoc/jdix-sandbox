@@ -1,0 +1,88 @@
+package initd
+
+import (
+	"os/exec"
+	"testing"
+	"time"
+)
+
+func TestReaperDeliversExitStatus(t *testing.T) {
+	r := NewReaper()
+	stop := make(chan struct{})
+	go r.Run(stop)
+	defer close(stop)
+
+	cases := []struct {
+		args []string
+		want int
+	}{
+		{[]string{"/bin/sh", "-c", "exit 0"}, 0},
+		{[]string{"/bin/sh", "-c", "exit 7"}, 7},
+		{[]string{"/bin/sh", "-c", "kill -TERM $$"}, 128 + 15},
+	}
+	for _, tc := range cases {
+		cmd := exec.Command(tc.args[0], tc.args[1:]...)
+		pid, err := r.StartCmd(cmd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan int, 1)
+		go func() { done <- r.Wait(pid) }()
+		select {
+		case got := <-done:
+			if got != tc.want {
+				t.Errorf("%v: got status %d want %d", tc.args, got, tc.want)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("%v: Wait did not return; the reaper lost the status", tc.args)
+		}
+	}
+}
+
+// A process that exits before Wait is called must not lose its status: that is
+// the race the pending map exists for.
+func TestReaperHandlesExitBeforeWait(t *testing.T) {
+	r := NewReaper()
+	stop := make(chan struct{})
+	go r.Run(stop)
+	defer close(stop)
+
+	cmd := exec.Command("/bin/sh", "-c", "exit 3")
+	pid, err := r.StartCmd(cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond) // let it exit and be reaped first
+
+	done := make(chan int, 1)
+	go func() { done <- r.Wait(pid) }()
+	select {
+	case got := <-done:
+		if got != 3 {
+			t.Fatalf("got %d want 3", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("status lost when the child exited before Wait")
+	}
+}
+
+func TestReaperCollectsOrphans(t *testing.T) {
+	r := NewReaper()
+	stop := make(chan struct{})
+	go r.Run(stop)
+	defer close(stop)
+
+	// The shell exits immediately while its child lingers, so the child is
+	// reparented. We only assert that reaping does not deadlock or panic; who
+	// inherits the orphan depends on whether we are really PID 1.
+	cmd := exec.Command("/bin/sh", "-c", "( sleep 0.2 & ) ; exit 0")
+	pid, err := r.StartCmd(cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := r.Wait(pid); got != 0 {
+		t.Fatalf("got %d want 0", got)
+	}
+	time.Sleep(500 * time.Millisecond)
+	r.reap() // must be safe to call with nothing left to collect
+}

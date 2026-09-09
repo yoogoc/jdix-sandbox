@@ -1,0 +1,23 @@
+# The sandbox base image: a tenant runtime plus the platform's own binaries.
+#
+# execd and jdix-init are copied in rather than baked into the tenant's image,
+# so a tenant-supplied image needs no cooperation from us — it just has to not
+# occupy /opt/jdix (enforced at admission, DESIGN.md §06.2).
+FROM debian:12-slim
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends bubblewrap ca-certificates python3 \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /opt/jdix/bin /opt/jdix/skel /var/lib/jdix/workspace /var/lib/jdix/vol /var/lib/jdix/ipc \
+ && ln -sf /usr/bin/bwrap /opt/jdix/bin/bwrap \
+ && useradd -u 1000 -m -s /bin/sh sandbox \
+ && chown 1000:1000 /var/lib/jdix/workspace \
+ && chmod 700 /var/lib/jdix/ipc
+
+COPY bin/linux/jdix-execd /opt/jdix/bin/jdix-execd
+COPY bin/linux/jdix-init  /opt/jdix/bin/jdix-init
+
+# execd is PID 1. It measures the node, waits to be bound, and only then builds
+# the namespace.
+ENTRYPOINT ["/opt/jdix/bin/jdix-execd"]
