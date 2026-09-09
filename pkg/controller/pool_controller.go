@@ -29,8 +29,17 @@ type PoolReconciler struct {
 	Platform PlatformImage
 	Prober   Prober
 
-	TokenSecret string
-	Now         func() time.Time
+	// NewToken mints each Pod's control-plane credential. Injectable so tests
+	// are not at the mercy of randomness.
+	NewToken func() string
+	Now      func() time.Time
+}
+
+func (r *PoolReconciler) newToken() string {
+	if r.NewToken != nil {
+		return r.NewToken()
+	}
+	return NewControlToken()
 }
 
 // poolResync is the idle cadence. Supply is not latency-critical — a request
@@ -71,10 +80,10 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	// A template still awaiting review must not consume warm capacity: warm
 	// Pods cost the platform money, and review is what authorises that spend.
 	if tpl.Status.Admission != sbxv1.AdmissionApproved {
-		return r.publishStatus(ctx, &pool, poolState{}, TemplateHash(&tpl), poolResync)
+		return r.publishStatus(ctx, &pool, poolState{}, TemplateHash(&tpl, r.Platform, r.Layout), poolResync)
 	}
 
-	hash := TemplateHash(&tpl)
+	hash := TemplateHash(&tpl, r.Platform, r.Layout)
 	var pods corev1.PodList
 	if err := r.List(ctx, &pods,
 		client.InNamespace(pool.Namespace),
@@ -112,7 +121,7 @@ func (r *PoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	desired := desiredReplicas(&pool)
 	have := len(st.idleCurrent) + len(st.pending)
 	for i := have; i < desired; i++ {
-		pod := BuildPod(&tpl, pool.Name, r.Platform, r.Layout, r.TokenSecret)
+		pod := BuildPod(&tpl, pool.Name, r.Platform, r.Layout, r.newToken())
 		if err := controllerutil.SetControllerReference(&pool, pod, r.Scheme); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -227,7 +236,7 @@ func (r *PoolReconciler) measure(ctx context.Context, p *corev1.Pod) (bwrap.Tier
 	if p.Status.PodIP == "" || r.Prober == nil {
 		return "", "", errNoProbe
 	}
-	tier, reason, err := r.Prober.Probe(ctx, p.Status.PodIP)
+	tier, reason, err := r.Prober.Probe(ctx, podRef(p))
 	if err != nil {
 		return "", "", err
 	}
@@ -268,7 +277,7 @@ func (r *PoolReconciler) publishStatus(ctx context.Context, pool *sbxv1.SandboxP
 	pool.Status.IdleByTier = st.byTier
 	pool.Status.TemplateHash = hash
 	if err := r.Status().Update(ctx, pool); err != nil {
-		return ctrl.Result{}, err
+		return requeueOnConflict(err)
 	}
 	return ctrl.Result{RequeueAfter: requeue}, nil
 }

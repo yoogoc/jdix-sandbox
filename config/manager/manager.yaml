@@ -77,7 +77,6 @@ spec:
           image: registry.internal/jdix/controller:dev
           args:
             - --platform-image=registry.internal/jdix/sandbox-base:dev
-            - --control-token-file=/var/run/jdix/control-token
             - --endpoint-suffix=sbx.example.com
             - --allowed-registries=registry.internal
             - --leader-elect
@@ -97,12 +96,3 @@ spec:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities: { drop: ["ALL"] }
-          volumeMounts:
-            - name: control-token
-              mountPath: /var/run/jdix
-              readOnly: true
-      volumes:
-        - name: control-token
-          secret:
-            secretName: jdix-control-token
-            defaultMode: 0400

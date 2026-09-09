@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"slices"
 	"strings"
 	"time"
 
@@ -158,12 +159,7 @@ func (k *APIKey) AllowsTemplate(name string) bool {
 	if len(k.AllowedTemplates) == 0 {
 		return true
 	}
-	for _, t := range k.AllowedTemplates {
-		if t == name {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(k.AllowedTemplates, name)
 }
 
 // Valid reports whether the key may be used at time now.

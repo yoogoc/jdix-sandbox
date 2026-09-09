@@ -23,6 +23,9 @@ spec:
     - jsonPath: .spec.minIsolationTier
       name: MinTier
       type: string
+    - jsonPath: .status.imagePinned
+      name: Pinned
+      type: boolean
     - jsonPath: .status.hash
       name: Hash
       type: string
@@ -78,8 +81,19 @@ spec:
                     type: object
                 type: object
               image:
-                description: ImageSpec pins the sandbox image.
+                description: ImageSpec names the sandbox image.
                 properties:
+                  pullPolicy:
+                    description: |-
+                      PullPolicy overrides how the kubelet fetches the image. It defaults to
+                      IfNotPresent, which is right for a digest and is also what makes a
+                      locally imported image usable; set Never for an image that exists only on
+                      the node, or Always to trade warm-Pod start-up time for freshness.
+                    enum:
+                    - Always
+                    - IfNotPresent
+                    - Never
+                    type: string
                   pullSecretRef:
                     description: |-
                       LocalObjectReference contains enough information to let you locate the
@@ -98,11 +112,31 @@ spec:
                     x-kubernetes-map-type: atomic
                   ref:
                     description: |-
-                      Ref is stored as a digest, not a tag. Admission resolves the tag once, at
-                      template creation, so a warm pool can never end up holding two different
-                      builds of the same "version".
+                      Ref may be written either way: name:tag, which is what people write, or
+                      name@sha256:… A tag is resolved to a digest once at admission and the
+                      result recorded in status.resolvedDigest; everything downstream uses the
+                      digest, so repointing the tag afterwards cannot leave one warm pool
+                      serving two different builds.
                     minLength: 1
                     type: string
+                  resolve:
+                    default: true
+                    description: |-
+                      Resolve turns tag resolution off for this template.
+
+                      Set it to false when the platform cannot reach the registry but the nodes
+                      can, when the image was built locally and never pushed, or in an
+                      air-gapped install. The kubelet then pulls by whatever Ref says, when a
+                      Pod starts.
+
+                      The cost is real and worth stating: without a digest, two Pods in the same
+                      warm pool can run different builds — a node that already cached the tag
+                      keeps what it has while a fresh node pulls whatever the tag points at now.
+                      The template hash also stops tracking the image, so moving the tag no
+                      longer rolls the pool, and a misspelled reference is not caught at
+                      admission: it surfaces later as every warm Pod failing to start, which
+                      reads as "the pool never fills" rather than "the template is wrong".
+                    type: boolean
                 required:
                 - ref
                 type: object
@@ -170,7 +204,7 @@ spec:
                       Claims lists the names of resources, defined in spec.resourceClaims,
                       that are used by this container.
 
-                      This is an alpha field and requires enabling the
+                      This field depends on the
                       DynamicResourceAllocation feature gate.
 
                       This field is immutable. It can only be set for containers.
@@ -339,7 +373,35 @@ spec:
                   Hash changes whenever anything that affects a Pod changes. Warm Pods carry
                   it as a label, which is how a rolling update knows what is stale.
                 type: string
+              imageBytes:
+                description: |-
+                  ImageBytes is the compressed size of the image, which is mostly what a
+                  cold start spends its time on. Zero when the image was never resolved.
+                format: int64
+                type: integer
+              imagePinned:
+                description: |-
+                  ImagePinned says whether Pods run an immutable reference. It is false for
+                  a template that opted out of resolution, and is the answer to "why is this
+                  pool running two different builds".
+                type: boolean
+              resolvedAt:
+                format: date-time
+                type: string
               resolvedDigest:
+                description: |-
+                  ResolvedDigest is what spec.image.ref meant at the moment it was resolved.
+
+                  A template may be written with a tag, which is what anyone would type.
+                  The tag is resolved once and the digest recorded here; everything
+                  downstream — the Pod, the pool's template hash — uses the digest. That is
+                  what stops a tag being repointed later from leaving one warm pool serving
+                  two different builds.
+                type: string
+              resolvedRef:
+                description: |-
+                  ResolvedRef is the spec.image.ref this digest came from, so a changed ref
+                  is re-resolved and an unchanged one is not.
                 type: string
             type: object
         type: object

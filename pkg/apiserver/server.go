@@ -13,7 +13,6 @@ import (
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"jdix.io/sandbox/pkg/api"
@@ -26,9 +25,19 @@ import (
 // It never touches a Pod: one component owns binding, and this is not it.
 type Server struct {
 	Client client.Client
-	Store  Store
-	Auth   *Authenticator
-	Log    *slog.Logger
+	// APIReader reads straight from the Kubernetes API server, bypassing the
+	// informer cache.
+	//
+	// Client is cache-backed, which is what makes the readiness poll nearly
+	// free — but writes go straight to the API server while reads come from a
+	// cache that lags behind it by however long a watch event takes to arrive.
+	// A create followed immediately by a read therefore sometimes reports the
+	// object as missing, which is the one answer that cannot be true: we just
+	// made it. This reader is consulted when that happens.
+	APIReader client.Reader
+	Store     Store
+	Auth      *Authenticator
+	Log       *slog.Logger
 
 	// ReadyTimeout bounds how long a create call waits before handing back a
 	// pending sandbox for the SDK to poll. Holding the connection longer helps
@@ -57,25 +66,47 @@ func (s *Server) newID() string {
 	return "sbx-" + strings.ToLower(randomSuffix())
 }
 
+// Route is one entry of the public API surface.
+//
+// The routes are data rather than a sequence of mux calls so that the OpenAPI
+// document and the server cannot drift apart: a test walks this table and the
+// spec and insists they describe the same thing. net/http's ServeMux does not
+// expose what was registered, so without a table there is nothing to compare.
+type Route struct {
+	Method  string
+	Path    string
+	Scope   Scope
+	Handler http.HandlerFunc
+}
+
+// Routes is the authenticated API surface. /healthz is deliberately absent: it
+// is infrastructure, not part of the contract the SDKs are generated from.
+func (s *Server) Routes() []Route {
+	return []Route{
+		{"POST", "/v1/sandboxes", ScopeSandboxCreate, s.createSandbox},
+		{"GET", "/v1/sandboxes", ScopeSandboxRead, s.listSandboxes},
+		{"GET", "/v1/sandboxes/{id}", ScopeSandboxRead, s.getSandbox},
+		{"DELETE", "/v1/sandboxes/{id}", ScopeSandboxDelete, s.deleteSandbox},
+
+		{"GET", "/v1/templates", ScopeTemplateRead, s.listTemplates},
+		{"POST", "/v1/templates/{name}/warmup-request", ScopeTemplateRead, s.requestWarmup},
+
+		{"GET", "/v1/quota", ScopeSandboxRead, s.getQuota},
+
+		// Warm capacity is the platform's money, so allocating it takes the
+		// admin scope: a tenant key can ask, never grant.
+		{"GET", "/v1/admin/warmup-requests", ScopeAdmin, s.listWarmupRequests},
+		{"POST", "/v1/admin/warmup-requests/{id}/review", ScopeAdmin, s.reviewWarmup},
+		{"GET", "/v1/admin/budget", ScopeAdmin, s.getBudget},
+	}
+}
+
 // Handler builds the routing table.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-
-	mux.Handle("POST /v1/sandboxes", RequireScope(ScopeSandboxCreate, http.HandlerFunc(s.createSandbox)))
-	mux.Handle("GET /v1/sandboxes", RequireScope(ScopeSandboxRead, http.HandlerFunc(s.listSandboxes)))
-	mux.Handle("GET /v1/sandboxes/{id}", RequireScope(ScopeSandboxRead, http.HandlerFunc(s.getSandbox)))
-	mux.Handle("DELETE /v1/sandboxes/{id}", RequireScope(ScopeSandboxDelete, http.HandlerFunc(s.deleteSandbox)))
-	mux.Handle("GET /v1/templates", RequireScope(ScopeTemplateRead, http.HandlerFunc(s.listTemplates)))
-	mux.Handle("GET /v1/quota", RequireScope(ScopeSandboxRead, http.HandlerFunc(s.getQuota)))
-	mux.Handle("POST /v1/templates/{name}/warmup-request",
-		RequireScope(ScopeTemplateRead, http.HandlerFunc(s.requestWarmup)))
-
-	// Warm capacity is the platform's money, so allocating it takes the admin
-	// scope — a tenant key can ask, never grant.
-	mux.Handle("GET /v1/admin/warmup-requests", RequireScope(ScopeAdmin, http.HandlerFunc(s.listWarmupRequests)))
-	mux.Handle("POST /v1/admin/warmup-requests/{id}/review", RequireScope(ScopeAdmin, http.HandlerFunc(s.reviewWarmup)))
-	mux.Handle("GET /v1/admin/budget", RequireScope(ScopeAdmin, http.HandlerFunc(s.getBudget)))
-
+	for _, r := range s.Routes() {
+		mux.Handle(r.Method+" "+r.Path, RequireScope(r.Scope, r.Handler))
+	}
 	authed := s.Auth.Authenticate(mux)
 
 	root := http.NewServeMux()
@@ -149,8 +180,7 @@ func (s *Server) createSandbox(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := s.checkQuota(r.Context(), p); err != nil {
-		var qe *quotaError
-		if errors.As(err, &qe) {
+		if qe, ok := errors.AsType[*quotaError](err); ok {
 			w.Header().Set("Retry-After", strconv.Itoa(qe.RetryAfterSeconds))
 			writeErr(w, http.StatusTooManyRequests, qe.Code, qe.Message)
 			return
@@ -161,13 +191,11 @@ func (s *Server) createSandbox(w http.ResponseWriter, r *http.Request) {
 
 	id := s.newID()
 	sbx := &sbxv1.Sandbox{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      id,
-			Namespace: p.Namespace,
-			Labels: map[string]string{
-				sbxv1.LabelTenant:   p.TenantID,
-				sbxv1.LabelTemplate: req.Template,
-			},
+		Name:      id,
+		Namespace: p.Namespace,
+		Labels: map[string]string{
+			sbxv1.LabelTenant:   p.TenantID,
+			sbxv1.LabelTemplate: req.Template,
 		},
 		Spec: sbxv1.SandboxSpec{
 			TemplateRef: req.Template,
@@ -213,6 +241,12 @@ func (s *Server) createSandbox(w http.ResponseWriter, r *http.Request) {
 // with whatever state the sandbox has reached.
 func (s *Server) respondWithSandbox(w http.ResponseWriter, r *http.Request, p *Principal, id, _ string) {
 	sbx, err := s.waitReady(r.Context(), p.Namespace, id)
+	if apierrors.IsNotFound(err) {
+		// Reached through the idempotency path, for a sandbox that has since
+		// been deleted. 404 says that; a 500 would blame the wrong thing.
+		writeErr(w, http.StatusNotFound, "not_found", "this sandbox no longer exists")
+		return
+	}
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "read_failed", err.Error())
 		return
@@ -225,6 +259,20 @@ func (s *Server) respondWithSandbox(w http.ResponseWriter, r *http.Request, p *P
 		code = http.StatusOK
 	}
 	writeJSON(w, code, resp)
+}
+
+// fetchSandbox reads a Sandbox, falling back to an uncached read when the cache
+// says it is missing.
+//
+// Only the NotFound case falls through: every other error means the read itself
+// failed, and asking again a different way would not help. The extra API call
+// happens on that one path, not on the hot one.
+func (s *Server) fetchSandbox(ctx context.Context, ns, name string, out *sbxv1.Sandbox) error {
+	err := s.Client.Get(ctx, client.ObjectKey{Namespace: ns, Name: name}, out)
+	if !apierrors.IsNotFound(err) || s.APIReader == nil {
+		return err
+	}
+	return s.APIReader.Get(ctx, client.ObjectKey{Namespace: ns, Name: name}, out)
 }
 
 func (s *Server) waitReady(ctx context.Context, ns, name string) (*sbxv1.Sandbox, error) {
@@ -240,8 +288,14 @@ func (s *Server) waitReady(ctx context.Context, ns, name string) (*sbxv1.Sandbox
 
 	var sbx sbxv1.Sandbox
 	for {
-		if err := s.Client.Get(ctx, client.ObjectKey{Namespace: ns, Name: name}, &sbx); err != nil {
-			return nil, err
+		if err := s.fetchSandbox(ctx, ns, name, &sbx); err != nil {
+			// The object was created moments ago, so a NotFound here can only
+			// mean the read is looking at something that has not caught up.
+			// Keep polling until the deadline rather than reporting that the
+			// sandbox does not exist, which would be plainly wrong.
+			if !apierrors.IsNotFound(err) || s.now().After(deadline) {
+				return nil, err
+			}
 		}
 		switch sbx.Status.Phase {
 		case sbxv1.PhaseRunning, sbxv1.PhaseFailed, sbxv1.PhaseExpired:
@@ -261,7 +315,7 @@ func (s *Server) waitReady(ctx context.Context, ns, name string) (*sbxv1.Sandbox
 func (s *Server) getSandbox(w http.ResponseWriter, r *http.Request) {
 	p, _ := PrincipalFrom(r.Context())
 	var sbx sbxv1.Sandbox
-	err := s.Client.Get(r.Context(), client.ObjectKey{Namespace: p.Namespace, Name: r.PathValue("id")}, &sbx)
+	err := s.fetchSandbox(r.Context(), p.Namespace, r.PathValue("id"), &sbx)
 	if apierrors.IsNotFound(err) {
 		writeErr(w, http.StatusNotFound, "not_found", "no such sandbox")
 		return
@@ -305,7 +359,7 @@ func (s *Server) deleteSandbox(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
 	var sbx sbxv1.Sandbox
-	err := s.Client.Get(r.Context(), client.ObjectKey{Namespace: p.Namespace, Name: id}, &sbx)
+	err := s.fetchSandbox(r.Context(), p.Namespace, id, &sbx)
 	if apierrors.IsNotFound(err) || (err == nil && sbx.Labels[sbxv1.LabelTenant] != p.TenantID) {
 		writeErr(w, http.StatusNotFound, "not_found", "no such sandbox")
 		return

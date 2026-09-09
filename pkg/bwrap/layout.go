@@ -34,21 +34,30 @@ func (t Tier) AtLeast(min Tier) bool { return t.Rank() >= min.Rank() }
 
 // Layout is where the platform put its own files inside the Pod. None of it is
 // tenant-controlled; it comes from the initContainer and the Pod spec.
+// Two roots, with different owners and different lifetimes:
+//
+//	/opt/jdix      installed by the initContainer, read-only at runtime
+//	/var/lib/jdix  written by execd as it runs
+//
+// The skeleton /etc files belong to the second: execd generates them at
+// start-up, so they are state, not installation. Putting them under /opt/jdix
+// would mean execd needs write access to the directory holding the platform's
+// own binaries, which is exactly what should not be writable.
 type Layout struct {
-	BinDir       string // /opt/jdix/bin      — execd, jdix-init, bwrap
-	SkelDir      string // /opt/jdix/skel     — passwd, group, resolv.conf
+	BinDir       string // /opt/jdix/bin       — execd, jdix-init, bwrap
+	SkelDir      string // /var/lib/jdix/skel  — passwd, group, resolv.conf
 	WorkspaceDir string // /var/lib/jdix/workspace
-	VolumeRoot   string // /var/lib/jdix/vol  — CSI/NFS volumes mount here
-	IPCDir       string // /var/lib/jdix/ipc  — unix socket dir on the outside
-	IPCMount     string // /run/jdix          — where IPCDir appears inside
-	InitTarget   string // /jdix-init         — jdix-init's path inside
+	VolumeRoot   string // /var/lib/jdix/vol   — CSI/NFS volumes mount here
+	IPCDir       string // /var/lib/jdix/ipc   — unix socket dir on the outside
+	IPCMount     string // /run/jdix           — where IPCDir appears inside
+	InitTarget   string // /jdix-init          — jdix-init's path inside
 }
 
 // DefaultLayout matches the paths baked into the initContainer and the Helm chart.
 func DefaultLayout() Layout {
 	return Layout{
 		BinDir:       "/opt/jdix/bin",
-		SkelDir:      "/opt/jdix/skel",
+		SkelDir:      "/var/lib/jdix/skel",
 		WorkspaceDir: "/var/lib/jdix/workspace",
 		VolumeRoot:   "/var/lib/jdix/vol",
 		IPCDir:       "/var/lib/jdix/ipc",

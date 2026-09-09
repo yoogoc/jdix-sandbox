@@ -31,8 +31,12 @@ func main() {
 		bwrapPath    = flag.String("bwrap", "/opt/jdix/bin/bwrap", "path to the bubblewrap binary")
 		volumesFlag  = flag.String("volumes", "", "template-declared volumes as name=path,name=path")
 		tierOverride = flag.String("tier", "", "skip detection and assert this tier (testing only)")
-		tokenFile    = flag.String("internal-token-file", "", "file holding the control-plane bearer token")
-		logLevel     = flag.String("log-level", "info", "debug|info|warn|error")
+		tokenEnv     = flag.String("internal-token-env", "JDIX_CONTROL_TOKEN",
+			"environment variable holding this Pod's control-plane token; the controller sets it per Pod")
+		tokenFile = flag.String("internal-token-file", "", "file holding the control-plane token, as an alternative to the environment")
+		allowOpen = flag.Bool("allow-unauthenticated-control", false,
+			"serve the control plane with no token at all — for local experiments only")
+		logLevel = flag.String("log-level", "info", "debug|info|warn|error")
 	)
 	flag.Parse()
 
@@ -51,10 +55,23 @@ func main() {
 	}
 	log.Info("isolation measured", "tier", probe.Tier, "reason", probe.Reason)
 
-	token, err := readToken(*tokenFile)
+	token, err := readToken(*tokenEnv, *tokenFile)
 	if err != nil {
-		log.Error("reading control-plane token", "err", err)
+		log.Error("reading the control-plane token", "err", err)
 		os.Exit(1)
+	}
+	if token == "" && !*allowOpen {
+		// Refuse rather than serve an open control plane. Anything that reaches
+		// :8081 can bind a sandbox to itself — that is a shell inside this Pod —
+		// so a missing token has to be loud. It is the kind of misconfiguration
+		// that otherwise works perfectly until someone notices.
+		log.Error("no control-plane token",
+			"env", *tokenEnv,
+			"hint", "the controller sets this per Pod; pass --internal-token-file, or --allow-unauthenticated-control if you really mean it")
+		os.Exit(1)
+	}
+	if token == "" {
+		log.Warn("control plane is unauthenticated", "reason", "--allow-unauthenticated-control")
 	}
 
 	srv := execd.New(log, execd.Config{
@@ -176,7 +193,15 @@ func parseVolumes(s string) map[string]string {
 	return out
 }
 
-func readToken(path string) (string, error) {
+// readToken prefers the environment, because that is how the controller hands
+// each Pod its own credential. A file is still accepted for deployments that
+// mount one.
+func readToken(envName, path string) (string, error) {
+	if envName != "" {
+		if v := strings.TrimSpace(os.Getenv(envName)); v != "" {
+			return v, nil
+		}
+	}
 	if path == "" {
 		return "", nil
 	}

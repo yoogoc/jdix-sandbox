@@ -22,6 +22,15 @@ import (
 
 const testNS = "tenant-abc"
 
+// testPlatform and testLayout are what every test builds Pods with. The hash
+// now covers the rendered Pod, so these have to be the same everywhere or two
+// tests would disagree about what "stale" means.
+func testPlatform() PlatformImage {
+	return PlatformImage{Ref: "registry.internal/jdix/platform@sha256:" + repeat64('b')}
+}
+
+func testLayout() bwrap.Layout { return bwrap.DefaultLayout() }
+
 func testScheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
 	s := runtime.NewScheme()
@@ -46,16 +55,18 @@ func newFakeClient(t *testing.T, objs ...client.Object) client.Client {
 // fakeBinder records what execd would have been told, and can be made to fail
 // the way a rejected filesystem spec does.
 type fakeBinder struct {
-	calls    []api.BindRequest
-	unbinds  []string
-	err      error
-	tier     bwrap.Tier
-	probeErr error
-	probes   []string
+	calls      []api.BindRequest
+	seenTokens []string
+	unbinds    []string
+	err        error
+	tier       bwrap.Tier
+	probeErr   error
+	probes     []string
 }
 
-func (f *fakeBinder) Bind(_ context.Context, podIP string, req api.BindRequest) (api.BindResponse, error) {
+func (f *fakeBinder) Bind(_ context.Context, pod PodRef, req api.BindRequest) (api.BindResponse, error) {
 	f.calls = append(f.calls, req)
+	f.seenTokens = append(f.seenTokens, pod.Token)
 	if f.err != nil {
 		return api.BindResponse{}, f.err
 	}
@@ -66,13 +77,13 @@ func (f *fakeBinder) Bind(_ context.Context, podIP string, req api.BindRequest) 
 	return api.BindResponse{SandboxID: req.SandboxID, IsolationTier: string(tier)}, nil
 }
 
-func (f *fakeBinder) Unbind(_ context.Context, podIP string) error {
-	f.unbinds = append(f.unbinds, podIP)
+func (f *fakeBinder) Unbind(_ context.Context, pod PodRef) error {
+	f.unbinds = append(f.unbinds, pod.IP)
 	return nil
 }
 
-func (f *fakeBinder) Probe(_ context.Context, podIP string) (bwrap.Tier, string, error) {
-	f.probes = append(f.probes, podIP)
+func (f *fakeBinder) Probe(_ context.Context, pod PodRef) (bwrap.Tier, string, error) {
+	f.probes = append(f.probes, pod.IP)
 	if f.probeErr != nil {
 		return "", "", f.probeErr
 	}
@@ -97,7 +108,7 @@ func approvedTemplate(name string, mods ...func(*sbxv1.SandboxTemplate)) *sbxv1.
 	for _, m := range mods {
 		m(t)
 	}
-	t.Status.Hash = TemplateHash(t)
+	t.Status.Hash = TemplateHash(t, testPlatform(), testLayout())
 	return t
 }
 
@@ -122,7 +133,15 @@ func warmPod(name, template, hash, tier string, ready bool) *corev1.Pod {
 			},
 			CreationTimestamp: metav1.NewTime(time.Now().Add(-time.Minute)),
 		},
-		Spec:   corev1.PodSpec{NodeName: "node-1"},
+		Spec: corev1.PodSpec{
+			NodeName: "node-1",
+			// Warm Pods carry their own credential in the spec, the same way the
+			// controller creates them.
+			Containers: []corev1.Container{{
+				Name: "sandbox",
+				Env:  []corev1.EnvVar{{Name: ControlTokenEnv, Value: "jct_" + name}},
+			}},
+		},
 		Status: corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.0.0.5"},
 	}
 	if tier != "" {
@@ -152,15 +171,15 @@ func newSandbox(name, template string, mods ...func(*sbxv1.Sandbox)) *sbxv1.Sand
 func newSandboxReconciler(t *testing.T, c client.Client, b *fakeBinder) *SandboxReconciler {
 	t.Helper()
 	return &SandboxReconciler{
-		Client:      c,
-		Scheme:      testScheme(t),
-		Layout:      bwrap.DefaultLayout(),
-		Platform:    PlatformImage{Ref: "registry.internal/jdix/platform@sha256:" + repeat64('b')},
-		Binder:      b,
-		Prober:      b,
-		TokenSecret: "jdix-control-token",
-		EndpointFor: func(id string) string { return "https://" + id + ".sbx.example.com" },
-		NewToken:    func() string { return "sbt_deterministic" },
+		Client:          c,
+		Scheme:          testScheme(t),
+		Layout:          bwrap.DefaultLayout(),
+		Platform:        PlatformImage{Ref: "registry.internal/jdix/platform@sha256:" + repeat64('b')},
+		Binder:          b,
+		Prober:          b,
+		EndpointFor:     func(id string) string { return "https://" + id + ".sbx.example.com" },
+		NewToken:        func() string { return "sbt_deterministic" },
+		NewControlToken: func() string { return "jct_deterministic" },
 	}
 }
 

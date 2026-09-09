@@ -54,7 +54,7 @@ func main() {
 	}
 	defer closeStore()
 
-	kube, err := newCachedClient(ctx, log)
+	kube, reader, err := newCachedClient(ctx, log)
 	if err != nil {
 		log.Error("connecting to Kubernetes", "err", err)
 		os.Exit(1)
@@ -62,6 +62,7 @@ func main() {
 
 	srv := &apiserver.Server{
 		Client:       kube,
+		APIReader:    reader,
 		Store:        store,
 		Auth:         apiserver.NewAuthenticator(store),
 		Log:          log,
@@ -149,17 +150,17 @@ func seed(mem *apiserver.MemStore, log *slog.Logger) {
 // The create path polls for readiness, and polling an informer cache costs
 // nothing. Polling the API server directly would put tens of requests per
 // create onto the control plane, which is a poor way to spend its capacity.
-func newCachedClient(ctx context.Context, log *slog.Logger) (client.Client, error) {
+func newCachedClient(ctx context.Context, log *slog.Logger) (client.Client, client.Reader, error) {
 	scheme := runtime.NewScheme()
 	if err := clientgoscheme.AddToScheme(scheme); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := sbxv1.AddToScheme(scheme); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	cl, err := cluster.New(ctrl.GetConfigOrDie(), func(o *cluster.Options) { o.Scheme = scheme })
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	go func() {
 		if err := cl.Start(ctx); err != nil {
@@ -167,9 +168,12 @@ func newCachedClient(ctx context.Context, log *slog.Logger) (client.Client, erro
 		}
 	}()
 	if !cl.GetCache().WaitForCacheSync(ctx) {
-		return nil, errors.New("informer cache did not sync")
+		return nil, nil, errors.New("informer cache did not sync")
 	}
-	return cl.GetClient(), nil
+	// The second reader bypasses the cache. It is only consulted when the cache
+	// claims an object is missing, which straight after a create can only mean
+	// it has not caught up yet.
+	return cl.GetClient(), cl.GetAPIReader(), nil
 }
 
 func newLogger(level string) *slog.Logger {

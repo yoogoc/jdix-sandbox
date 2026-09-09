@@ -1,0 +1,469 @@
+# jdix-sandbox data plane — the sandbox's own API.
+#
+# Reached at the `endpoint` a created sandbox returns, through jdix-gateway,
+# which routes by hostname and proxies to the Pod. Served by jdix-execd, which
+# authenticates and forwards to jdix-init inside the namespace.
+#
+# The control plane — creating and destroying sandboxes — is a separate surface;
+# see control-plane.yaml.
+openapi: 3.1.0
+
+info:
+  title: jdix-sandbox data plane
+  version: 0.1.0
+  summary: Run commands and move files inside one sandbox.
+  description: |
+    Every request here concerns exactly one sandbox: the hostname identifies it
+    and the bearer token authorises it. There is no path parameter for the
+    sandbox, because there is nothing else this endpoint could be about.
+
+    Streaming endpoints upgrade to WebSocket. OpenAPI has no way to describe a
+    WebSocket, so they appear as GET operations returning 101 and the frame
+    protocol is documented under `WebSocketFrame`. Generators should skip them
+    and use a WebSocket client; both SDKs do.
+
+servers:
+  - url: https://{sandbox}.sbx.example.com
+    description: One sandbox, through jdix-gateway
+    variables:
+      sandbox:
+        default: sbx-a3f9k2mq
+        description: The sandbox id.
+
+security:
+  - sandboxToken: []
+
+tags:
+  - name: exec
+  - name: files
+  - name: lifecycle
+
+paths:
+  /v1/exec:
+    post:
+      operationId: exec
+      tags: [exec]
+      summary: Run a command and wait for it
+      description: |
+        A non-zero `exitCode` is not an error. The request succeeded and the
+        command failed, and those are different things.
+
+        Output is capped. When it is reached the response is truncated and
+        `truncated` is set, rather than the sandbox being allowed to fill
+        memory. Use the streaming form for anything long.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ExecRequest' }
+      responses:
+        '200':
+          description: The command finished. Check `exitCode`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExecResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '410': { $ref: '#/components/responses/Expired' }
+
+  /v1/exec/stream:
+    get:
+      operationId: execStream
+      tags: [exec]
+      summary: Run a command, streaming its output (WebSocket)
+      description: |
+        Upgrades to WebSocket. The client may send `stdin`, `signal` and `ping`
+        frames; the server sends `stdout`, `stderr`, `exit`, `error` and `ping`.
+        See `WebSocketFrame`.
+      parameters:
+        - name: cmd
+          in: query
+          required: true
+          schema: { type: string }
+        - name: timeoutSeconds
+          in: query
+          required: false
+          schema: { type: integer }
+      responses:
+        '101':
+          description: Switching protocols.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/pty:
+    get:
+      operationId: pty
+      tags: [exec]
+      summary: Open an interactive terminal (WebSocket)
+      description: |
+        Same frame protocol as `execStream`, with a real terminal: `resize`
+        frames take effect, and stdout and stderr are merged because a PTY has
+        only one stream. Defaults to a login shell.
+      parameters:
+        - name: cmd
+          in: query
+          required: false
+          schema: { type: string }
+        - name: cols
+          in: query
+          required: false
+          schema: { type: integer, default: 120 }
+        - name: rows
+          in: query
+          required: false
+          schema: { type: integer, default: 40 }
+      responses:
+        '101':
+          description: Switching protocols.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/processes:
+    get:
+      operationId: listProcesses
+      tags: [exec]
+      summary: Processes this sandbox started through the API
+      description: |
+        Only processes launched through this API, not everything running inside.
+        A partial list presented as complete would be worse than a short one.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [processes]
+                properties:
+                  processes:
+                    type: array
+                    items: { $ref: '#/components/schemas/Process' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/processes/{pid}:
+    parameters:
+      - name: pid
+        in: path
+        required: true
+        schema: { type: integer }
+    delete:
+      operationId: signalProcess
+      tags: [exec]
+      summary: Signal a process group
+      description: |
+        The signal goes to the process group, so a shell's children go with it
+        rather than being orphaned.
+      parameters:
+        - name: signal
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [SIGTERM, SIGINT, SIGQUIT, SIGKILL, SIGHUP]
+            default: SIGTERM
+      responses:
+        '200':
+          description: Signal delivered.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  pid: { type: integer }
+                  signal: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404':
+          description: This sandbox did not start that process.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/files:
+    get:
+      operationId: readFile
+      tags: [files]
+      summary: Download a file
+      description: Supports Range requests, so a large artefact can be resumed.
+      parameters:
+        - $ref: '#/components/parameters/Path'
+      responses:
+        '200':
+          description: The file.
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        '206':
+          description: Partial content, in answer to a Range request.
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        '400':
+          description: The path names a directory; use `listFiles`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/PathRefused' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      operationId: writeFile
+      tags: [files]
+      summary: Write a file
+      description: Parent directories are created, inside the root and never above it.
+      parameters:
+        - $ref: '#/components/parameters/Path'
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        '200':
+          description: Written.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  path: { type: string }
+                  bytes: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/PathRefused' }
+    delete:
+      operationId: deleteFile
+      tags: [files]
+      summary: Delete a file or directory
+      parameters:
+        - $ref: '#/components/parameters/Path'
+        - name: recursive
+          in: query
+          required: false
+          schema: { type: boolean, default: false }
+      responses:
+        '200':
+          description: Deleted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  path: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/PathRefused' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/files/list:
+    get:
+      operationId: listFiles
+      tags: [files]
+      summary: List a directory
+      parameters:
+        - $ref: '#/components/parameters/Path'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [path, entries]
+                properties:
+                  path: { type: string }
+                  entries:
+                    type: array
+                    items: { $ref: '#/components/schemas/FileInfo' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/PathRefused' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/keepalive:
+    post:
+      operationId: keepAlive
+      tags: [lifecycle]
+      summary: Extend the sandbox's deadline
+      description: |
+        Answered by execd rather than forwarded inside, because the deadline
+        lives with the process that enforces it.
+      parameters:
+        - name: ttlSeconds
+          in: query
+          required: false
+          schema: { type: integer, default: 300 }
+      responses:
+        '200':
+          description: Extended.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  expiresAt: { type: string, format: date-time }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '410': { $ref: '#/components/responses/Expired' }
+
+components:
+  securitySchemes:
+    sandboxToken:
+      type: http
+      scheme: bearer
+      description: |
+        `Authorization: Bearer sbt_…`, the token returned once by
+        `createSandbox`.
+
+        It is checked twice: by the gateway and again by execd. A misconfigured
+        NetworkPolicy that let something reach a Pod directly should not be the
+        only thing between a stranger and a shell.
+
+        A WebSocket opened from a browser cannot set headers, so `?token=` is
+        accepted for those. Prefer the header everywhere else: query strings end
+        up in logs.
+
+  parameters:
+    Path:
+      name: path
+      in: query
+      required: true
+      description: |
+        An absolute path inside the sandbox. It must resolve within the
+        workspace or a mount declared read-write; symlinks are refused rather
+        than followed.
+      schema: { type: string, examples: ["/workspace/main.py"] }
+
+  responses:
+    BadRequest:
+      description: Malformed request.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unauthorized:
+      description: |
+        Missing or wrong token, or the sandbox is not bound. All three give the
+        same answer, so the endpoint cannot be used to learn whether a sandbox
+        exists.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Expired:
+      description: The sandbox's TTL elapsed and it no longer exists.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: No such file or directory.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    PathRefused:
+      description: |
+        The path lies outside every directory this sandbox may touch, traverses
+        a symlink out of one, or is read-only. `code` says which.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          examples: [path_forbidden, path_escape, read_only, expired]
+        message: { type: string }
+
+    ExecRequest:
+      type: object
+      description: Exactly one of `cmd` or `argv`.
+      properties:
+        cmd:
+          type: string
+          description: Passed to `/bin/sh -c`.
+        argv:
+          type: array
+          items: { type: string }
+          description: |
+            Executed directly, with no shell. Prefer this whenever any part of
+            the command comes from untrusted input: there is nothing for a
+            quoting mistake to escape into.
+        cwd: { type: string }
+        env:
+          type: object
+          additionalProperties: { type: string }
+        timeoutSeconds:
+          type: integer
+          default: 120
+          description: |
+            On expiry the process group gets SIGTERM, a grace period, then
+            SIGKILL.
+        maxOutputBytes: { type: integer, default: 4194304 }
+
+    ExecResult:
+      type: object
+      required: [exitCode, durationMs]
+      properties:
+        exitCode:
+          type: integer
+          description: |
+            Shell convention: a signalled process reports 128 plus the signal.
+        stdout: { type: string }
+        stderr: { type: string }
+        durationMs: { type: integer }
+        truncated:
+          type: boolean
+          description: Output hit `maxOutputBytes`, so it is not the whole story.
+        timedOut: { type: boolean }
+
+    Process:
+      type: object
+      properties:
+        pid: { type: integer }
+        cmd: { type: string }
+        started: { type: string, format: date-time }
+        running: { type: boolean }
+
+    FileInfo:
+      type: object
+      properties:
+        name: { type: string }
+        path: { type: string }
+        size: { type: integer }
+        mode: { type: string, examples: ["-rw-r--r--"] }
+        isDir: { type: boolean }
+        modified: { type: string, format: date-time }
+        symlink:
+          type: boolean
+          description: |
+            Reported so a listing is honest. Reading through one is refused: a
+            link inside a volume can point anywhere.
+
+    WebSocketFrame:
+      type: object
+      description: |
+        One frame shape serves exec, PTY and file watching, so the SDKs and the
+        Console terminal share a single codec.
+
+        Payloads are base64 rather than binary frames: intermediaries handle
+        text frames far more predictably, and the size cost is irrelevant next
+        to a shell session. `seq` increases monotonically on server output, for
+        resuming after a dropped connection.
+
+        Application-level `ping`/`pong` runs every 30 seconds. WebSocket control
+        frames are not reliably forwarded by every load balancer in the path,
+        which is the usual cause of a session that dies silently after a minute
+        of quiet.
+      required: [t]
+      properties:
+        t:
+          type: string
+          enum: [stdin, stdout, stderr, resize, signal, exit, error, ping, pong, event]
+        d: { type: string, contentEncoding: base64 }
+        seq: { type: integer }
+        cols: { type: integer }
+        rows: { type: integer }
+        sig: { type: string }
+        code: { type: integer }
+        durationMs: { type: integer }
+        errCode: { type: string }
+        msg: { type: string }

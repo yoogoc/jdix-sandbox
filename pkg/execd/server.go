@@ -216,6 +216,13 @@ func bearer(r *http.Request) string {
 	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
 		return strings.TrimPrefix(h, "Bearer ")
 	}
+	// The Kubernetes API server strips Authorization when it proxies to a Pod,
+	// so a controller reaching us through pods/proxy sends the token here
+	// instead. Removing this makes the API-proxy transport fail with a bare 401
+	// that points nowhere near the cause.
+	if h := r.Header.Get(api.ControlTokenHeader); h != "" {
+		return h
+	}
 	// Accepted as a convenience for browser contexts that cannot set headers,
 	// such as a WebSocket opened directly from the Console.
 	return r.URL.Query().Get("token")

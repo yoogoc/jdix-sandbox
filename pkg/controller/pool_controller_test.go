@@ -36,12 +36,12 @@ func newPool(name, template string, replicas int32, mods ...func(*sbxv1.SandboxP
 func newPoolReconciler(t *testing.T, c client.Client, b *fakeBinder) *PoolReconciler {
 	t.Helper()
 	return &PoolReconciler{
-		Client:      c,
-		Scheme:      testScheme(t),
-		Layout:      bwrap.DefaultLayout(),
-		Platform:    PlatformImage{Ref: "registry.internal/jdix/platform@sha256:" + repeat64('b')},
-		Prober:      b,
-		TokenSecret: "jdix-control-token",
+		Client:   c,
+		Scheme:   testScheme(t),
+		Layout:   bwrap.DefaultLayout(),
+		Platform: PlatformImage{Ref: "registry.internal/jdix/platform@sha256:" + repeat64('b')},
+		Prober:   b,
+		NewToken: func() string { return "jct_pool_test" },
 	}
 }
 

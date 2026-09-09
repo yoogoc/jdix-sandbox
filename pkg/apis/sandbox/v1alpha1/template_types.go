@@ -15,14 +15,46 @@ const (
 	EgressNone       EgressMode = "none"
 )
 
-// ImageSpec pins the sandbox image.
+// ImageSpec names the sandbox image.
 type ImageSpec struct {
-	// Ref is stored as a digest, not a tag. Admission resolves the tag once, at
-	// template creation, so a warm pool can never end up holding two different
-	// builds of the same "version".
+	// Ref may be written either way: name:tag, which is what people write, or
+	// name@sha256:… A tag is resolved to a digest once at admission and the
+	// result recorded in status.resolvedDigest; everything downstream uses the
+	// digest, so repointing the tag afterwards cannot leave one warm pool
+	// serving two different builds.
 	// +kubebuilder:validation:MinLength=1
-	Ref           string                       `json:"ref"`
+	Ref string `json:"ref"`
+
+	// Resolve turns tag resolution off for this template.
+	//
+	// Set it to false when the platform cannot reach the registry but the nodes
+	// can, when the image was built locally and never pushed, or in an
+	// air-gapped install. The kubelet then pulls by whatever Ref says, when a
+	// Pod starts.
+	//
+	// The cost is real and worth stating: without a digest, two Pods in the same
+	// warm pool can run different builds — a node that already cached the tag
+	// keeps what it has while a fresh node pulls whatever the tag points at now.
+	// The template hash also stops tracking the image, so moving the tag no
+	// longer rolls the pool, and a misspelled reference is not caught at
+	// admission: it surfaces later as every warm Pod failing to start, which
+	// reads as "the pool never fills" rather than "the template is wrong".
+	// +kubebuilder:default=true
+	Resolve *bool `json:"resolve,omitempty"`
+
+	// PullPolicy overrides how the kubelet fetches the image. It defaults to
+	// IfNotPresent, which is right for a digest and is also what makes a
+	// locally imported image usable; set Never for an image that exists only on
+	// the node, or Always to trade warm-Pod start-up time for freshness.
+	// +kubebuilder:validation:Enum=Always;IfNotPresent;Never
+	PullPolicy corev1.PullPolicy `json:"pullPolicy,omitempty"`
+
 	PullSecretRef *corev1.LocalObjectReference `json:"pullSecretRef,omitempty"`
+}
+
+// ShouldResolve reports whether the tag should be resolved to a digest.
+func (i ImageSpec) ShouldResolve() bool {
+	return i.Resolve == nil || *i.Resolve
 }
 
 // TemplateVolume declares storage that sandboxes may mount subpaths of.
@@ -120,7 +152,26 @@ type SandboxTemplateStatus struct {
 	Admission AdmissionState `json:"admission,omitempty"`
 	// AdmissionReason is shown to the tenant verbatim, so it says what to fix.
 	AdmissionReason string `json:"admissionReason,omitempty"`
-	ResolvedDigest  string `json:"resolvedDigest,omitempty"`
+
+	// ResolvedDigest is what spec.image.ref meant at the moment it was resolved.
+	//
+	// A template may be written with a tag, which is what anyone would type.
+	// The tag is resolved once and the digest recorded here; everything
+	// downstream — the Pod, the pool's template hash — uses the digest. That is
+	// what stops a tag being repointed later from leaving one warm pool serving
+	// two different builds.
+	ResolvedDigest string `json:"resolvedDigest,omitempty"`
+	// ResolvedRef is the spec.image.ref this digest came from, so a changed ref
+	// is re-resolved and an unchanged one is not.
+	ResolvedRef string       `json:"resolvedRef,omitempty"`
+	ResolvedAt  *metav1.Time `json:"resolvedAt,omitempty"`
+	// ImageBytes is the compressed size of the image, which is mostly what a
+	// cold start spends its time on. Zero when the image was never resolved.
+	ImageBytes int64 `json:"imageBytes,omitempty"`
+	// ImagePinned says whether Pods run an immutable reference. It is false for
+	// a template that opted out of resolution, and is the answer to "why is this
+	// pool running two different builds".
+	ImagePinned bool `json:"imagePinned,omitempty"`
 
 	// HasVolumes drives review: a template with a volume implies a warm pool,
 	// and a warm pool costs the platform money, so it needs a human.
@@ -133,6 +184,7 @@ type SandboxTemplateStatus struct {
 // +kubebuilder:resource:shortName=sbxtpl
 // +kubebuilder:printcolumn:name="Admission",type=string,JSONPath=`.status.admission`
 // +kubebuilder:printcolumn:name="MinTier",type=string,JSONPath=`.spec.minIsolationTier`
+// +kubebuilder:printcolumn:name="Pinned",type=boolean,JSONPath=`.status.imagePinned`
 // +kubebuilder:printcolumn:name="Hash",type=string,JSONPath=`.status.hash`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 

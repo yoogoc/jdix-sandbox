@@ -35,6 +35,15 @@ type StatusResponse struct {
 	StartedAt     time.Time  `json:"startedAt"`
 }
 
+// ControlTokenHeader carries the control-plane token when Authorization cannot.
+//
+// The Kubernetes API server strips Authorization from requests it proxies to a
+// Pod, so that a caller's cluster credentials never reach the workload. That is
+// the right thing for it to do, and it means anything reaching execd through
+// the pods/proxy subresource has to carry its credential somewhere else. Custom
+// headers are forwarded untouched.
+const ControlTokenHeader = "X-Jdix-Control-Token"
+
 // Error is the uniform error body for every HTTP surface.
 type Error struct {
 	Code    string `json:"code"`

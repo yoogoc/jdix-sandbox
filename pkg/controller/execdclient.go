@@ -14,30 +14,52 @@ import (
 	"jdix.io/sandbox/pkg/bwrap"
 )
 
+// PodRef says how to reach one sandbox Pod, and how to prove we may.
+//
+// Both the address and the object identity are carried, because there is more
+// than one way to get there: the direct transport dials the IP, while the
+// API-proxy transport asks the Kubernetes API server to forward by name. A
+// transport that only knew the IP could not offer the second.
+//
+// Token is that Pod's own control-plane credential, not a platform-wide one.
+// It is generated when the Pod is created and read back from the Pod's spec,
+// so nothing has to store it and there is no shared secret to keep in sync.
+type PodRef struct {
+	Namespace string
+	Name      string
+	IP        string
+	Token     string
+}
+
+func (p PodRef) String() string {
+	if p.Namespace != "" && p.Name != "" {
+		return p.Namespace + "/" + p.Name + " (" + p.IP + ")"
+	}
+	return p.IP
+}
+
 // Binder talks to execd's control plane. It is an interface so the reconciler
-// can be tested without a running Pod; the network is the one thing a fake
-// client cannot stand in for.
+// can be tested without a running Pod, and so the transport can be swapped —
+// see APIProxyExecdClient.
 type Binder interface {
-	Bind(ctx context.Context, podIP string, req api.BindRequest) (api.BindResponse, error)
-	Unbind(ctx context.Context, podIP string) error
+	Bind(ctx context.Context, pod PodRef, req api.BindRequest) (api.BindResponse, error)
+	Unbind(ctx context.Context, pod PodRef) error
 }
 
 // Prober measures a warm Pod before it is allowed to serve anyone.
 type Prober interface {
-	Probe(ctx context.Context, podIP string) (tier bwrap.Tier, reason string, err error)
+	Probe(ctx context.Context, pod PodRef) (tier bwrap.Tier, reason string, err error)
 }
 
 // HTTPExecdClient implements both over the cluster-internal control port.
 type HTTPExecdClient struct {
-	Token   string
 	Port    int32
 	Timeout time.Duration
 	client  *http.Client
 }
 
-func NewHTTPExecdClient(token string) *HTTPExecdClient {
+func NewHTTPExecdClient() *HTTPExecdClient {
 	return &HTTPExecdClient{
-		Token:   token,
 		Port:    PortControl,
 		Timeout: 20 * time.Second,
 		client: &http.Client{
@@ -55,7 +77,7 @@ func (c *HTTPExecdClient) url(podIP, path string) string {
 	return "http://" + net.JoinHostPort(podIP, fmt.Sprint(c.Port)) + path
 }
 
-func (c *HTTPExecdClient) do(ctx context.Context, method, url string, body any, out any) error {
+func (c *HTTPExecdClient) do(ctx context.Context, method, url, token string, body any, out any) error {
 	var rdr io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -74,8 +96,8 @@ func (c *HTTPExecdClient) do(ctx context.Context, method, url string, body any, 
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	if c.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.Token)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
 	resp, err := c.client.Do(req)
@@ -99,23 +121,26 @@ func (c *HTTPExecdClient) do(ctx context.Context, method, url string, body any, 
 	return nil
 }
 
-func (c *HTTPExecdClient) Bind(ctx context.Context, podIP string, req api.BindRequest) (api.BindResponse, error) {
+func (c *HTTPExecdClient) Bind(ctx context.Context, pod PodRef, req api.BindRequest) (api.BindResponse, error) {
 	var out api.BindResponse
-	err := c.do(ctx, http.MethodPost, c.url(podIP, "/internal/v1/bind"), req, &out)
+	err := c.do(ctx, http.MethodPost, c.url(pod.IP, "/internal/v1/bind"), pod.Token, req, &out)
 	return out, err
 }
 
-func (c *HTTPExecdClient) Unbind(ctx context.Context, podIP string) error {
-	return c.do(ctx, http.MethodPost, c.url(podIP, "/internal/v1/unbind"), nil, nil)
+func (c *HTTPExecdClient) Unbind(ctx context.Context, pod PodRef) error {
+	return c.do(ctx, http.MethodPost, c.url(pod.IP, "/internal/v1/unbind"), pod.Token, nil, nil)
 }
 
-func (c *HTTPExecdClient) Probe(ctx context.Context, podIP string) (bwrap.Tier, string, error) {
-	var out struct {
-		IsolationTier bwrap.Tier `json:"isolationTier"`
-		Reason        string     `json:"reason"`
-	}
-	if err := c.do(ctx, http.MethodGet, c.url(podIP, "/internal/v1/probe"), nil, &out); err != nil {
+func (c *HTTPExecdClient) Probe(ctx context.Context, pod PodRef) (bwrap.Tier, string, error) {
+	var out probeResponse
+	if err := c.do(ctx, http.MethodGet, c.url(pod.IP, "/internal/v1/probe"), pod.Token, nil, &out); err != nil {
 		return "", "", err
 	}
 	return out.IsolationTier, out.Reason, nil
+}
+
+// probeResponse is execd's readiness answer, shared by both transports.
+type probeResponse struct {
+	IsolationTier bwrap.Tier `json:"isolationTier"`
+	Reason        string     `json:"reason"`
 }

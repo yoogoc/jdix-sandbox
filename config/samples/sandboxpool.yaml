@@ -1,0 +1,13 @@
+apiVersion: sandbox.jdix.io/v1alpha1
+kind: SandboxPool
+metadata:
+  name: py315-small
+  namespace: tenant-dev
+spec:
+  templateRef: py315-small
+  replicas: 3
+  minReplicas: 1
+  maxReplicas: 5
+  notReadyTimeoutSeconds: 30000
+  idleTTLSeconds: 360000
+  maxSurge: 3

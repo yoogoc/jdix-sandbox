@@ -55,23 +55,45 @@ func New(log *slog.Logger, workspace string) *Server {
 // process. Nothing else in the program may call wait4.
 func (s *Server) Reaper() *Reaper { return s.reaper }
 
+// Route is one entry of the data-plane surface.
+//
+// These are data rather than a sequence of mux calls so the OpenAPI document
+// and the server can be compared: net/http's ServeMux does not expose what was
+// registered, so without a table there is nothing to check the spec against.
+type Route struct {
+	Method  string
+	Path    string
+	Handler http.HandlerFunc
+}
+
+// Routes is the public surface, the part gateway proxies and the SDKs call.
+//
+// /health and /configure are excluded: they are execd's private conversation
+// with this process over a unix socket, not part of anyone's contract.
+func (s *Server) Routes() []Route {
+	return []Route{
+		{"POST", "/v1/exec", s.handleExec},
+		{"GET", "/v1/exec/stream", s.handleExecStream},
+		{"GET", "/v1/pty", s.handlePTY},
+		{"GET", "/v1/processes", s.handleProcessList},
+		{"DELETE", "/v1/processes/{pid}", s.handleProcessSignal},
+
+		{"GET", "/v1/files", s.handleFileGet},
+		{"PUT", "/v1/files", s.handleFilePut},
+		{"DELETE", "/v1/files", s.handleFileDelete},
+		{"GET", "/v1/files/list", s.handleFileList},
+	}
+}
+
 // Handler builds the mux. Every route here is unauthenticated on purpose: the
 // only thing that can reach the socket is execd, and the socket is 0600.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", s.handleHealth)
 	mux.HandleFunc("POST /configure", s.handleConfigure)
-
-	mux.HandleFunc("POST /v1/exec", s.handleExec)
-	mux.HandleFunc("GET /v1/exec/stream", s.handleExecStream)
-	mux.HandleFunc("GET /v1/pty", s.handlePTY)
-	mux.HandleFunc("GET /v1/processes", s.handleProcessList)
-	mux.HandleFunc("DELETE /v1/processes/{pid}", s.handleProcessSignal)
-
-	mux.HandleFunc("GET /v1/files", s.handleFileGet)
-	mux.HandleFunc("PUT /v1/files", s.handleFilePut)
-	mux.HandleFunc("DELETE /v1/files", s.handleFileDelete)
-	mux.HandleFunc("GET /v1/files/list", s.handleFileList)
+	for _, r := range s.Routes() {
+		mux.HandleFunc(r.Method+" "+r.Path, r.Handler)
+	}
 	return mux
 }
 

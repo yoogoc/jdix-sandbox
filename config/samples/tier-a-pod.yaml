@@ -1,0 +1,68 @@
+# A standalone sandbox Pod that actually reaches the userns tier.
+#
+# This is jdix-execd without the controller, useful for checking what a node can
+# enforce before deploying anything. Verified on k3s v1.33 / containerd 2.0 /
+# kernel 7.0 (OrbStack), where it measures `tier: userns`.
+#
+# The three settings below are not optional, and each was established by
+# watching the alternative fail:
+#
+#   hostUsers: false      Kubernetes rejects procMount: Unmasked without it.
+#   procMount: Unmasked   Kubernetes masks parts of /proc by bind-mounting over
+#                         them. bubblewrap then cannot mount a fresh procfs
+#                         inside its own namespace: the kernel's
+#                         mount_too_revealing() check returns EPERM, because the
+#                         new mount would uncover what the runtime hid.
+#                         Symptom: "Can't mount proc on /newroot/proc".
+#   seccomp: Unconfined   The RuntimeDefault profile denies unshare with
+#                         CLONE_NEWUSER to a container without CAP_SYS_ADMIN —
+#                         exactly the call bubblewrap makes.
+#                         Symptom: "No permissions to create new namespace".
+#
+# Relaxing seccomp is paid for by hostUsers: false, which puts the container in
+# a user namespace mapped to unprivileged host ids. A narrow custom profile
+# (RuntimeDefault plus CLONE_NEWUSER) would be strictly better; see DESIGN.md.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: jdix-sandbox-demo
+  namespace: default
+  labels:
+    app.kubernetes.io/managed-by: jdix-controller
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  hostUsers: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+    seccompProfile:
+      type: Unconfined
+  containers:
+    - name: sandbox
+      image: jdix/sandbox-base:dev
+      imagePullPolicy: Never          # loaded with hack/load-image.sh
+      args: ["--log-level=info"]
+      env:
+        # Every Pod carries its own control-plane credential; execd refuses to
+        # start without one. The controller mints these per Pod — this literal
+        # exists only because nothing is managing this standalone Pod.
+        - { name: JDIX_CONTROL_TOKEN, value: "jct-replace-me" }
+      ports:
+        - { name: data, containerPort: 8080 }
+        - { name: control, containerPort: 8081 }
+      resources:
+        requests: { cpu: 250m, memory: 512Mi }
+        limits:   { cpu: "2",  memory: 2Gi }
+      securityContext:
+        allowPrivilegeEscalation: false
+        procMount: Unmasked
+        capabilities:
+          drop: ["ALL"]
+      readinessProbe:
+        httpGet: { path: /internal/v1/probe, port: 8081 }
+        initialDelaySeconds: 1
+        periodSeconds: 2
+        failureThreshold: 30

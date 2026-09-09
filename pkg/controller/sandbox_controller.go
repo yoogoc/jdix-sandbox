@@ -37,20 +37,46 @@ type SandboxReconciler struct {
 	Binder   Binder
 	Prober   Prober
 
-	// TokenSecret holds the control-plane bearer token mounted into every Pod.
-	TokenSecret string
 	// EndpointFor renders the public URL for a sandbox.
 	EndpointFor func(sandboxID string) string
-	// Now and NewToken are injectable so tests are not at the mercy of the clock
-	// or of randomness.
-	Now      func() time.Time
-	NewToken func() string
+	// Now, NewToken and NewControlToken are injectable so tests are not at the
+	// mercy of the clock or of randomness. NewToken mints the sandbox's
+	// data-plane token; NewControlToken mints a Pod's control-plane credential.
+	Now             func() time.Time
+	NewToken        func() string
+	NewControlToken func() string
+}
+
+func (r *SandboxReconciler) newControlToken() string {
+	if r.NewControlToken != nil {
+		return r.NewControlToken()
+	}
+	return NewControlToken()
 }
 
 // requeueBinding is how often we re-check a Pod that is still starting. Short,
 // because on a pool hit this is the only thing between a request and a ready
 // sandbox.
 const requeueBinding = 150 * time.Millisecond
+
+// conflictRetry is how long to wait after losing a write race. Short, because
+// the informer cache catches up in milliseconds and a Sandbox waiting to bind
+// is on someone's request path.
+const conflictRetry = 50 * time.Millisecond
+
+// requeueOnConflict turns an optimistic-concurrency conflict into a plain retry.
+//
+// Losing a write race is ordinary here: this reconciler writes status using an
+// object it read from an informer cache that may not have caught up with its own
+// previous write. Returning the error does retry — controller-runtime sees to
+// that — but it logs at error level with a stack trace, and a log full of
+// routine contention is a log nobody reads when something is actually wrong.
+func requeueOnConflict(err error) (ctrl.Result, error) {
+	if apierrors.IsConflict(err) {
+		return ctrl.Result{RequeueAfter: conflictRetry}, nil
+	}
+	return ctrl.Result{}, err
+}
 
 func (r *SandboxReconciler) now() time.Time {
 	if r.Now != nil {
@@ -73,6 +99,9 @@ func (r *SandboxReconciler) newToken() string {
 // +kubebuilder:rbac:groups=sandbox.jdix.io,resources=sandboxes/finalizers,verbs=update
 // +kubebuilder:rbac:groups=sandbox.jdix.io,resources=sandboxtemplates,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;patch;delete
+// pods/proxy is only needed by the apiserver-proxy transport, which exists so
+// the controller can run outside the cluster during development.
+// +kubebuilder:rbac:groups="",resources=pods/proxy,verbs=get;create
 
 func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	lg := log.FromContext(ctx)
@@ -91,9 +120,12 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if !controllerutil.ContainsFinalizer(&sbx, sbxv1.FinalizerSandbox) {
 		controllerutil.AddFinalizer(&sbx, sbxv1.FinalizerSandbox)
 		if err := r.Update(ctx, &sbx); err != nil {
-			return ctrl.Result{}, err
+			return requeueOnConflict(err)
 		}
-		return ctrl.Result{Requeue: true}, nil
+		// Carry on with the object Update just wrote back, which carries the
+		// new resourceVersion. Requeueing instead would re-read from the
+		// informer cache, which has not necessarily caught up yet — and the
+		// status write that follows would then fail on a stale version.
 	}
 
 	switch sbx.Status.Phase {
@@ -125,7 +157,27 @@ func (r *SandboxReconciler) acquirePod(ctx context.Context, sbx *sbxv1.Sandbox) 
 		return r.fail(ctx, sbx, "TemplateRejected", "template failed admission: "+tpl.Status.AdmissionReason)
 	}
 
-	pod, err := r.claimWarmPod(ctx, sbx, tpl)
+	// A previous pass may have claimed a Pod and then failed to record it: the
+	// claim is one write and the status is another, and the second can lose a
+	// race. The Pod carries the binding too — its labels and owner reference
+	// name this Sandbox — so look there before taking a second one. Without
+	// this, a single lost status write strands a Pod that nothing will ever
+	// collect, because the Sandbox it belongs to does exist.
+	pod, err := r.findClaimedPod(ctx, sbx)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if pod != nil {
+		lg.Info("adopting a Pod claimed by an earlier pass", "sandbox", sbx.Name, "pod", pod.Name)
+		sbx.Status.Phase = sbxv1.PhaseBinding
+		sbx.Status.PodName = pod.Name
+		if err := r.Status().Update(ctx, sbx); err != nil {
+			return requeueOnConflict(err)
+		}
+		return ctrl.Result{RequeueAfter: requeueBinding}, nil
+	}
+
+	pod, err = r.claimWarmPod(ctx, sbx, tpl)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -144,9 +196,31 @@ func (r *SandboxReconciler) acquirePod(ctx context.Context, sbx *sbxv1.Sandbox) 
 	sbx.Status.PodName = pod.Name
 	sbx.Status.ColdStart = cold
 	if err := r.Status().Update(ctx, sbx); err != nil {
-		return ctrl.Result{}, err
+		return requeueOnConflict(err)
 	}
 	return ctrl.Result{RequeueAfter: requeueBinding}, nil
+}
+
+// findClaimedPod returns the Pod already bound to this Sandbox, if there is one.
+//
+// The claim writes the sandbox id onto the Pod, so the Pod is an independent
+// record of the binding. That makes acquiring idempotent: whatever happened to
+// the status write, a second Pod is never taken.
+func (r *SandboxReconciler) findClaimedPod(ctx context.Context, sbx *sbxv1.Sandbox) (*corev1.Pod, error) {
+	var pods corev1.PodList
+	err := r.List(ctx, &pods,
+		client.InNamespace(sbx.Namespace),
+		client.MatchingLabels{sbxv1.LabelSandboxID: sbx.Name})
+	if err != nil {
+		return nil, err
+	}
+	for i := range pods.Items {
+		p := &pods.Items[i]
+		if p.DeletionTimestamp.IsZero() {
+			return p, nil
+		}
+	}
+	return nil, nil
 }
 
 // claimWarmPod flips one idle Pod to bound using an optimistic-concurrency
@@ -158,7 +232,7 @@ func (r *SandboxReconciler) claimWarmPod(ctx context.Context, sbx *sbxv1.Sandbox
 		client.InNamespace(sbx.Namespace),
 		client.MatchingLabels{
 			sbxv1.LabelTemplate:     tpl.Name,
-			sbxv1.LabelTemplateHash: TemplateHash(tpl),
+			sbxv1.LabelTemplateHash: TemplateHash(tpl, r.Platform, r.Layout),
 			sbxv1.LabelState:        sbxv1.StateIdle,
 		})
 	if err != nil {
@@ -176,6 +250,13 @@ func (r *SandboxReconciler) claimWarmPod(ctx context.Context, sbx *sbxv1.Sandbox
 		// request path is exactly the latency the warm pool exists to avoid.
 		tier := bwrap.Tier(p.Labels[sbxv1.LabelIsolationTier])
 		if tier == "" || !tier.AtLeast(bwrap.Tier(tpl.Spec.MinIsolationTier)) {
+			continue
+		}
+		// A Pod with no control-plane credential was built by a different
+		// version of this controller. Binding it would fail with a bare 401
+		// that says nothing about the real cause, so it is passed over and left
+		// for the pool's staleness sweep.
+		if PodToken(p) == "" {
 			continue
 		}
 		candidates = append(candidates, p)
@@ -209,7 +290,7 @@ func (r *SandboxReconciler) claimWarmPod(ctx context.Context, sbx *sbxv1.Sandbox
 }
 
 func (r *SandboxReconciler) createPod(ctx context.Context, sbx *sbxv1.Sandbox, tpl *sbxv1.SandboxTemplate) (*corev1.Pod, error) {
-	pod := BuildPod(tpl, "", r.Platform, r.Layout, r.TokenSecret)
+	pod := BuildPod(tpl, "", r.Platform, r.Layout, r.newControlToken())
 	pod.Labels[sbxv1.LabelState] = sbxv1.StateBound
 	pod.Labels[sbxv1.LabelSandboxID] = sbx.Name
 	if tenant := sbx.Labels[sbxv1.LabelTenant]; tenant != "" {
@@ -251,7 +332,7 @@ func (r *SandboxReconciler) bind(ctx context.Context, sbx *sbxv1.Sandbox) (ctrl.
 	if tier == "" {
 		// A cold-started Pod has never been measured. Do it now, before it can
 		// run anything.
-		tier, _, err = r.Prober.Probe(ctx, pod.Status.PodIP)
+		tier, _, err = r.Prober.Probe(ctx, podRef(&pod))
 		if err != nil {
 			return ctrl.Result{RequeueAfter: requeueBinding}, nil
 		}
@@ -267,7 +348,7 @@ func (r *SandboxReconciler) bind(ctx context.Context, sbx *sbxv1.Sandbox) (ctrl.
 
 	token := r.newToken()
 	ttl := ttlFor(sbx, tpl)
-	resp, err := r.Binder.Bind(ctx, pod.Status.PodIP, api.BindRequest{
+	resp, err := r.Binder.Bind(ctx, podRef(&pod), api.BindRequest{
 		SandboxID:  sbx.Name,
 		Tenant:     sbx.Labels[sbxv1.LabelTenant],
 		Filesystem: filesystemFor(sbx, tpl),
@@ -295,7 +376,7 @@ func (r *SandboxReconciler) bind(ctx context.Context, sbx *sbxv1.Sandbox) (ctrl.
 	}
 	metaHelper.setReady(&sbx.Status.Conditions, r.now())
 	if err := r.Status().Update(ctx, sbx); err != nil {
-		return ctrl.Result{}, err
+		return requeueOnConflict(err)
 	}
 
 	// Record the tier on the Pod too, so a human reading `kubectl get pods` sees
@@ -331,14 +412,14 @@ func (r *SandboxReconciler) expire(ctx context.Context, sbx *sbxv1.Sandbox, reas
 	}
 	sbx.Status.Phase = sbxv1.PhaseExpired
 	sbx.Status.Reason = reason
-	return ctrl.Result{}, r.Status().Update(ctx, sbx)
+	return requeueOnConflict(r.Status().Update(ctx, sbx))
 }
 
 func (r *SandboxReconciler) fail(ctx context.Context, sbx *sbxv1.Sandbox, reason, msg string) (ctrl.Result, error) {
 	log.FromContext(ctx).Info("sandbox failed", "sandbox", sbx.Name, "reason", reason, "message", msg)
 	sbx.Status.Phase = sbxv1.PhaseFailed
 	sbx.Status.Reason = reason + ": " + msg
-	return ctrl.Result{}, r.Status().Update(ctx, sbx)
+	return requeueOnConflict(r.Status().Update(ctx, sbx))
 }
 
 func (r *SandboxReconciler) finalize(ctx context.Context, sbx *sbxv1.Sandbox) (ctrl.Result, error) {
@@ -346,7 +427,7 @@ func (r *SandboxReconciler) finalize(ctx context.Context, sbx *sbxv1.Sandbox) (c
 		return ctrl.Result{}, err
 	}
 	controllerutil.RemoveFinalizer(sbx, sbxv1.FinalizerSandbox)
-	return ctrl.Result{}, r.Update(ctx, sbx)
+	return requeueOnConflict(r.Update(ctx, sbx))
 }
 
 func (r *SandboxReconciler) deletePod(ctx context.Context, sbx *sbxv1.Sandbox) error {
@@ -365,7 +446,7 @@ func (r *SandboxReconciler) deletePod(ctx context.Context, sbx *sbxv1.Sandbox) e
 	// grace period. Best effort: if the Pod is already unreachable, deleting it
 	// is still the right next step.
 	if pod.Status.PodIP != "" && r.Binder != nil {
-		_ = r.Binder.Unbind(ctx, pod.Status.PodIP)
+		_ = r.Binder.Unbind(ctx, podRef(&pod))
 	}
 	return client.IgnoreNotFound(r.Delete(ctx, &pod))
 }
@@ -435,6 +516,17 @@ func envFor(sbx *sbxv1.Sandbox) map[string]string {
 		out[e.Name] = e.Value
 	}
 	return out
+}
+
+// podRef packages what a transport needs to reach a Pod, whichever route it
+// takes.
+func podRef(p *corev1.Pod) PodRef {
+	return PodRef{
+		Namespace: p.Namespace,
+		Name:      p.Name,
+		IP:        p.Status.PodIP,
+		Token:     PodToken(p),
+	}
 }
 
 func podReady(p *corev1.Pod) bool {

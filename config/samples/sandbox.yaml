@@ -1,0 +1,14 @@
+apiVersion: sandbox.jdix.io/v1alpha1
+kind: Sandbox
+metadata:
+  name: sbx-example
+  namespace: tenant-dev
+  labels:
+    sandbox.jdix.io/tenant: tenant-dev
+spec:
+  templateRef: py315-small
+  ttlSeconds: 600
+  filesystem:
+    workspace: { path: /workspace }
+  env:
+    - { name: RUN_ID, value: "42" }

@@ -269,6 +269,22 @@ spec 里的路径来自租户，是**不可信输入**。生成器必须：
 - `securityContext`：`runAsNonRoot: true`、`allowPrivilegeEscalation: false`、`capabilities.drop: [ALL]`、`readOnlyRootFilesystem` 尽可能开。
 - 默认 deny-all egress，禁沙箱互访（§08）。
 
+**②′ 实测修正（2026-09-09，k3s 1.33 / containerd 2.0 / 内核 7.0）：Tier A 与 `seccompProfile: RuntimeDefault` 不可兼得。**
+
+原文假设 Tier A 可以在 `RuntimeDefault` 下工作。实测不成立，Tier A 需要同时放开三项，每一项都是把另一种失败方式排除后确认的：
+
+| 设置 | 不加会怎样 |
+|---|---|
+| `hostUsers: false` | Kubernetes 直接拒绝 `procMount: Unmasked`（API server 校验报错） |
+| `procMount: Unmasked` | k8s 用 bind mount 遮蔽了 `/proc` 的一部分；bwrap 在自己的 ns 里挂新 procfs 时，内核 `mount_too_revealing()` 判定会"揭开"被遮蔽的路径，返回 EPERM。症状：`Can't mount proc on /newroot/proc` |
+| `seccompProfile: Unconfined` | `RuntimeDefault` 对没有 `CAP_SYS_ADMIN` 的容器禁止带 `CLONE_NEWUSER` 的 `unshare`——正是 bwrap 必须调的那一个。症状：`No permissions to create new namespace` |
+
+放松 seccomp 的代价由 `hostUsers: false` 抵消：容器本身已在一个映射到非特权宿主 uid 的 user namespace 里，seccomp 原本要挡的系统调用不再对宿主有权限。
+
+**这与 v0.3「不做自定义 seccomp profile」的决定直接冲突。** 更好的做法是一个很窄的自定义 profile——`RuntimeDefault` 加上允许 `CLONE_NEWUSER`——它既保留了 RuntimeDefault 的全部收敛，又只开了必须开的那一个口子，且没有"兼容性预算"问题（放开一个调用不会让任何工作负载跑不起来）。建议把这一项单独提回 P1。
+
+`BuildPod` 已按 `minIsolationTier` 区分处理：要 `userns` 的模板才放开这三项，其余模板保持 `RuntimeDefault`。可直接跑通的 Pod 清单见 `config/samples/tier-a-pod.yaml`。
+
 **③ seccomp 只用 `RuntimeDefault`，不做自定义 profile。**
 
 自定义 profile 需要先回答"愿意为收紧攻击面付出多少兼容性代价"，而租户自带镜像意味着这个代价无法预估。本期不做这个投入。
@@ -527,8 +543,9 @@ apiserver 创建/更新 `SandboxTemplate` 时同步执行，同时配 Validating
 | 检查 | 说明 | 优先级 |
 |---|---|---|
 | Registry 白名单 | 只允许平台 registry + 租户显式登记的 registry。禁止 `docker.io` 匿名拉取（限流会造成随机冷启动失败） | P0 |
-| Tag → digest 解析 | 创建时解析并**固化 digest**，模板永远按 digest 拉，避免 tag 漂移导致池内新旧镜像混杂 | P0 |
-| 镜像大小上限 | 建议 5GB。超大镜像会把冷启动拖到分钟级 | P0 |
+| Tag → digest 解析 | **用户写 tag**（`name:tag`，也接受 `name@sha256:`）。controller 向 registry 解析一次，把 digest 记进 `status.resolvedDigest`，此后 Pod 和 template-hash 都用 digest。tag 事后被重新指向不会让一个池里混两个构建；改 tag 则会重新解析并滚动池。用 `imagePullSecrets` 的凭据解析，保证解出来的就是 Pod 会拉的那个。registry 临时故障不判 Rejected，而是 Pending + 30s 重试 | P0 |
+| 可按模板关闭解析 | `spec.image.resolve: false`——平台连不到 registry 但节点能连、镜像只在本地构建过、气隙环境，这三种情况必须能跳过。此时由 kubelet 按 tag 拉，`status.imagePinned: false` 标明未钉住。**代价要写在字段注释里让人看见**：同一个池里的 Pod 可能跑不同构建（已缓存该 tag 的节点保持旧的，新节点拉新的）；tag 被移动不再滚动池；拼错的镜像名不在准入时暴露，而是变成"每个预热 Pod 都起不来"，读起来像"池填不满"而不是"模板写错了" | P0 |
+| 镜像大小上限 | 默认 5GiB（`--max-image-bytes`），从解析时拿到的 manifest 层大小求和。超大镜像会把冷启动拖到分钟级。已固化 digest 的引用拿不到大小，此时跳过该检查——否则会把唯一能离线工作的路径也堵死 | P0 |
 | 平台路径冲突检查 | 镜像不得在 `/opt/jdix`、`/var/lib/jdix` 放东西（initContainer 会覆盖，但要提前报错而非运行时诡异失败） | P0 |
 | **卷 accessModes 校验** | 见 §05.4 ①，含 RWO 直接拒绝或强制 `replicas: 0` | P0 |
 | **带卷模板转人工审批** | 见 §05.4 ③ | P0 |

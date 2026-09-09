@@ -1,0 +1,558 @@
+# jdix-sandbox control plane — the API the SDKs are generated from.
+#
+# This document is the contract, not a description of it: the Go and Python
+# clients take their transport layer from here, and a test in pkg/apiserver
+# walks the server's route table against this file so the two cannot drift.
+#
+# The sandbox's own API — running commands, moving files — is a separate
+# surface reached at the endpoint a created sandbox returns. See data-plane.yaml.
+openapi: 3.1.0
+
+info:
+  title: jdix-sandbox control plane
+  version: 0.1.0
+  summary: Create, inspect and destroy sandboxes.
+  description: |
+    Sandboxes are created here and used elsewhere. A successful create returns
+    an `endpoint` and a one-time `token`; everything you actually run inside the
+    sandbox goes to that endpoint, described in `data-plane.yaml`.
+
+    The token is issued once and is not stored by the control plane. A sandbox
+    fetched later can be inspected but not executed against unless you kept it.
+  license:
+    name: Apache-2.0
+
+servers:
+  - url: https://api.jdix.example.com
+    description: Production
+  - url: http://127.0.0.1:8000
+    description: Local development (hack/dev/run.sh apiserver)
+
+security:
+  - apiKey: []
+
+tags:
+  - name: sandboxes
+  - name: templates
+  - name: quota
+  - name: admin
+    description: |
+      Warm capacity is charged to the platform, not to the tenant that benefits
+      from it. A tenant key can ask for it; only an admin key can grant it.
+
+paths:
+  /v1/sandboxes:
+    post:
+      operationId: createSandbox
+      tags: [sandboxes]
+      summary: Start a sandbox
+      description: |
+        Returns as soon as the sandbox is running. On a warm-pool hit that is a
+        couple of hundred milliseconds; on a cold start the call may return with
+        `state: pending`, and the client polls `getSandbox` from there.
+
+        Set `Idempotency-Key` whenever the call might be replayed — a job
+        runner, a queue consumer, anything with at-least-once delivery. Without
+        one, a retry starts a second sandbox and bills for both.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateSandboxRequest' }
+      responses:
+        '201':
+          description: The sandbox exists. It may still be starting; check `state`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Sandbox' }
+        '200':
+          description: |
+            The sandbox exists but failed to start. `reason` says why. This is a
+            200 describing a failure, not an error about the request.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Sandbox' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: |
+            The `Idempotency-Key` was already used with a different request body.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429': { $ref: '#/components/responses/QuotaExceeded' }
+
+    get:
+      operationId: listSandboxes
+      tags: [sandboxes]
+      summary: List this tenant's sandboxes
+      parameters:
+        - name: state
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/SandboxState' }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sandboxes]
+                properties:
+                  sandboxes:
+                    type: array
+                    items: { $ref: '#/components/schemas/Sandbox' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/sandboxes/{id}:
+    parameters:
+      - $ref: '#/components/parameters/SandboxID'
+    get:
+      operationId: getSandbox
+      tags: [sandboxes]
+      summary: Fetch one sandbox
+      description: |
+        The data-plane `token` is not returned: it is issued once, at creation,
+        and the control plane does not keep it.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Sandbox' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      operationId: deleteSandbox
+      tags: [sandboxes]
+      summary: Destroy a sandbox
+      responses:
+        '200':
+          description: Deleted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  id: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/templates:
+    get:
+      operationId: listTemplates
+      tags: [templates]
+      summary: List templates this key may use
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [templates]
+                properties:
+                  templates:
+                    type: array
+                    items: { $ref: '#/components/schemas/Template' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/templates/{name}/warmup-request:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      operationId: requestWarmup
+      tags: [templates]
+      summary: Ask for warm capacity
+      description: |
+        Records a request; it does not create a pool. Warm Pods are charged to
+        the platform, so an administrator decides. Poll `listWarmupRequests` or
+        wait to be told.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WarmupRequestBody' }
+      responses:
+        '202':
+          description: The request is queued for review.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WarmupRequest' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/quota:
+    get:
+      operationId: getQuota
+      tags: [quota]
+      summary: This tenant's limits and current usage
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Quota' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/admin/warmup-requests:
+    get:
+      operationId: listWarmupRequests
+      tags: [admin]
+      summary: The review queue
+      parameters:
+        - name: status
+          in: query
+          required: false
+          description: Defaults to `pending`.
+          schema:
+            type: string
+            enum: [pending, approved, rejected]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [requests]
+                properties:
+                  requests:
+                    type: array
+                    items: { $ref: '#/components/schemas/WarmupRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /v1/admin/warmup-requests/{id}/review:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      operationId: reviewWarmup
+      tags: [admin]
+      summary: Approve or reject a warm-up request
+      description: |
+        Approving writes the pool. The approved size may differ from the size
+        asked for, and is checked against the platform's remaining budget.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReviewBody' }
+      responses:
+        '200':
+          description: Reviewed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WarmupRequest' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: |
+            Already reviewed, or approving would exceed the platform's warm
+            capacity budget. `code` distinguishes them.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v1/admin/budget:
+    get:
+      operationId: getBudget
+      tags: [admin]
+      summary: Platform warm capacity and what is left of it
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Budget' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+components:
+  securitySchemes:
+    apiKey:
+      type: http
+      scheme: bearer
+      description: |
+        `Authorization: Bearer jdix_sk_<keyid>_<secret>`.
+
+        The header `X-Jdix-Api-Key` is accepted as an alternative for clients
+        that cannot set Authorization.
+
+        Keys carry scopes; an endpoint refuses with 403 `insufficient_scope`
+        when the key lacks the one it needs.
+
+  parameters:
+    SandboxID:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, examples: ["sbx-a3f9k2mq"] }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        A retry with the same key returns the first sandbox instead of starting
+        a second one. Honoured for 24 hours.
+      schema: { type: string, maxLength: 255 }
+
+  responses:
+    BadRequest:
+      description: The request is malformed or refers to something that does not exist.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unauthorized:
+      description: |
+        The API key is missing, malformed, revoked or expired. All four give the
+        same answer: distinguishing them would turn the endpoint into an oracle
+        for enumerating keys.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: The key is valid but not allowed to do this.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: |
+        No such object. Another tenant's sandbox is reported this way too, so
+        the endpoint cannot be used to discover that it exists.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    QuotaExceeded:
+      description: A tenant limit was reached.
+      headers:
+        Retry-After:
+          description: Seconds to wait. A quota does not clear in milliseconds.
+          schema: { type: integer }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: Stable, machine-readable. Switch on this, not on `message`.
+          examples: [quota_concurrent, insufficient_scope, template_not_found]
+        message:
+          type: string
+          description: |
+            Written for the person who has to fix it. Where a request was
+            refused for its contents, this names the offending field.
+
+    SandboxState:
+      type: string
+      enum: [pending, binding, running, expired, failed, terminating]
+
+    Sandbox:
+      type: object
+      required: [id, state, template, coldStart]
+      properties:
+        id: { type: string, examples: ["sbx-a3f9k2mq"] }
+        state: { $ref: '#/components/schemas/SandboxState' }
+        template: { type: string }
+        isolationTier:
+          $ref: '#/components/schemas/IsolationTier'
+        endpoint:
+          type: string
+          format: uri
+          description: Where the data-plane API lives. Empty until the sandbox is running.
+        token:
+          type: string
+          description: |
+            The data-plane credential, returned only from `createSandbox` and
+            never stored. Keep it if you intend to come back to this sandbox.
+        expiresAt: { type: string, format: date-time }
+        coldStart:
+          type: boolean
+          description: |
+            True when the warm pool was missed. The clearest signal that a pool
+            is undersized.
+        reason:
+          type: string
+          description: Why the sandbox failed, when it did.
+
+    IsolationTier:
+      type: string
+      enum: [userns, capadmin, chroot]
+      description: |
+        What the node running this sandbox can actually enforce.
+
+        `userns` is the target: an unprivileged user namespace, no extra
+        capability. `capadmin` relies on CAP_SYS_ADMIN. `chroot` has no mount
+        namespace at all and cannot honour `filesystem.mounts`.
+
+    CreateSandboxRequest:
+      type: object
+      required: [template]
+      properties:
+        template: { type: string }
+        ttlSeconds:
+          type: integer
+          minimum: 1
+          description: |
+            Clamped to the template's ceiling. The sandbox is destroyed when it
+            elapses, whether or not anyone is still using it.
+        filesystem: { $ref: '#/components/schemas/FilesystemSpec' }
+        env:
+          type: object
+          additionalProperties: { type: string }
+          description: Not for secrets; these appear in the Sandbox object.
+        metadata:
+          type: object
+          additionalProperties: { type: string }
+          description: Opaque bookkeeping, echoed back on reads.
+
+    FilesystemSpec:
+      type: object
+      description: What the sandbox is allowed to see.
+      properties:
+        workspace:
+          type: object
+          properties:
+            path: { type: string, default: /workspace }
+            sizeLimit: { type: string, examples: ["2Gi"] }
+        mounts:
+          type: array
+          maxItems: 32
+          items: { $ref: '#/components/schemas/Mount' }
+        allowSystemPaths:
+          type: array
+          items: { type: string }
+          description: Must be a subset of the platform allowlist; it cannot be extended.
+        hide:
+          type: array
+          items: { type: string }
+          description: Paths to blank out. May not cover a mount or the workspace.
+
+    Mount:
+      type: object
+      required: [path, source]
+      description: |
+        Binds part of a template-declared volume into the sandbox. There is no
+        way to name a host path or inline storage parameters: a tenant can only
+        reach storage an administrator already approved.
+      properties:
+        path:
+          type: string
+          pattern: '^/.*'
+          description: |
+            Where it appears inside the sandbox. May not overlap the platform's
+            own paths, nor replace a system directory wholesale.
+        source:
+          type: object
+          required: [volume]
+          properties:
+            volume: { type: string }
+            subPath:
+              type: string
+              description: Resolved beneath the volume root; it cannot escape it.
+        readOnly: { type: boolean, default: false }
+
+    Template:
+      type: object
+      required: [name, admission, minIsolationTier]
+      properties:
+        name: { type: string }
+        admission:
+          type: string
+          enum: [Pending, PendingReview, Approved, Rejected]
+        admissionReason:
+          type: string
+          description: Why it was rejected or is waiting, in words you can act on.
+        minIsolationTier: { $ref: '#/components/schemas/IsolationTier' }
+        defaultTTLSeconds: { type: integer }
+        maxTTLSeconds: { type: integer }
+        hasVolumes:
+          type: boolean
+          description: |
+            A template with volumes needs a warm pool, and warm pools cost the
+            platform money — so it waits for review.
+
+    Quota:
+      type: object
+      properties:
+        unlimited:
+          type: boolean
+          description: Present when no quota row exists for this tenant.
+        maxConcurrent: { type: integer }
+        running: { type: integer }
+        maxCreatePerMinute: { type: integer }
+
+    WarmupRequestBody:
+      type: object
+      required: [replicas]
+      properties:
+        replicas: { type: integer, minimum: 1 }
+        reason:
+          type: string
+          description: What the capacity is for. An administrator reads this.
+
+    WarmupRequest:
+      type: object
+      required: [id, tenantId, template, replicas, status, createdAt]
+      properties:
+        id: { type: string }
+        tenantId: { type: string }
+        template: { type: string }
+        replicas: { type: integer }
+        reason: { type: string }
+        status:
+          type: string
+          enum: [pending, approved, rejected]
+        reviewedBy: { type: string }
+        reviewNote: { type: string }
+        createdAt: { type: string, format: date-time }
+        reviewedAt: { type: string, format: date-time }
+
+    ReviewBody:
+      type: object
+      required: [approve]
+      properties:
+        approve: { type: boolean }
+        replicas:
+          type: integer
+          description: |
+            Grant a different size than was asked for. Omitted means the
+            requested size.
+        note: { type: string }
+
+    Budget:
+      type: object
+      description: |
+        `allocated` is derived from the approved requests rather than stored, so
+        it cannot drift away from what is actually running.
+      properties:
+        totalIdlePods: { type: integer }
+        allocated: { type: integer }
+        remaining: { type: integer }
+        totalCPU: { type: string }
+        totalMemory: { type: string }

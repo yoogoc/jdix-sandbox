@@ -1,0 +1,20 @@
+apiVersion: sandbox.jdix.io/v1alpha1
+kind: SandboxTemplate
+metadata:
+  name: py315-small
+  namespace: tenant-dev
+spec:
+  minIsolationTier: userns
+  defaultTTLSeconds: 1800
+  maxTTLSeconds: 14400
+  image:
+    ref: m.daocloud.io/docker.io/library/python:3.15-rc
+    resolve: false
+  filesystemDefaults:
+    workspace: { sizeLimit: 2Gi }
+    allowSystemPaths: [/usr, /bin, /sbin, /lib, /lib64, /etc/ssl]
+  network:
+    egress: restricted
+  resources:
+    requests: { cpu: 250m, memory: 512Mi }
+    limits:   { cpu: "2",  memory: 2Gi }

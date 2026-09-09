@@ -1,23 +1,61 @@
-# The sandbox base image: a tenant runtime plus the platform's own binaries.
+# The sandbox base image: a tenant runtime plus everything the platform needs
+# to build a namespace inside it.
 #
-# execd and jdix-init are copied in rather than baked into the tenant's image,
-# so a tenant-supplied image needs no cooperation from us — it just has to not
-# occupy /opt/jdix (enforced at admission, DESIGN.md §06.2).
+# An initContainer copies /opt/jdix into an emptyDir that the main container
+# shares, so the platform's binaries reach a tenant-supplied image without that
+# image having to cooperate. The only thing asked of a tenant image is that it
+# does not itself occupy /opt/jdix — which admission enforces.
+
+# ── stage 1: collect bubblewrap and everything it needs to run elsewhere ──
+FROM debian:12-slim AS platform
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends bubblewrap binutils \
+ && rm -rf /var/lib/apt/lists/*
+
+# bwrap is dynamically linked against libc, libcap, libselinux and pcre2. It has
+# to run inside the *tenant's* image, which may have none of them — or a
+# different libc entirely — so its loader and libraries travel with it and it is
+# invoked through them explicitly. Shipping a bare binary, or a symlink into
+# /usr/bin, works only while the tenant image happens to look like this one.
+RUN set -eux; \
+    mkdir -p /out/bin /out/lib; \
+    cp /usr/bin/bwrap /out/bin/bwrap.real; \
+    ldd /usr/bin/bwrap \
+      | awk '/=>/ { if ($3 != "") print $3 } !/=>/ && $1 ~ /^\// { print $1 }' \
+      | sort -u | xargs -I{} cp -L {} /out/lib/; \
+    loader="$(basename "$(ldd /usr/bin/bwrap | awk '!/=>/ && $1 ~ /ld-linux/ { print $1 }')")"; \
+    test -n "$loader"; \
+    printf '#!/bin/sh\nexec /opt/jdix/lib/%s --library-path /opt/jdix/lib /opt/jdix/bin/bwrap.real "$@"\n' \
+      "$loader" > /out/bin/bwrap; \
+    chmod 0755 /out/bin/bwrap; \
+    /out/lib/"$loader" --library-path /out/lib /out/bin/bwrap.real --version
+
+# ── stage 2: the image sandboxes actually run ──
 FROM debian:12-slim
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends bubblewrap ca-certificates python3 \
- && rm -rf /var/lib/apt/lists/*
+ && apt-get install -y --no-install-recommends ca-certificates python3 \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd -u 1000 -m -d /home/sandbox -s /bin/sh sandbox
 
-RUN mkdir -p /opt/jdix/bin /opt/jdix/skel /var/lib/jdix/workspace /var/lib/jdix/vol /var/lib/jdix/ipc \
- && ln -sf /usr/bin/bwrap /opt/jdix/bin/bwrap \
- && useradd -u 1000 -m -s /bin/sh sandbox \
- && chown 1000:1000 /var/lib/jdix/workspace \
- && chmod 700 /var/lib/jdix/ipc
+COPY --from=platform /out/bin/ /opt/jdix/bin/
+COPY --from=platform /out/lib/ /opt/jdix/lib/
 
+# Built with CGO_ENABLED=0, so these run in any image regardless of its libc.
 COPY bin/linux/jdix-execd /opt/jdix/bin/jdix-execd
 COPY bin/linux/jdix-init  /opt/jdix/bin/jdix-init
 
-# execd is PID 1. It measures the node, waits to be bound, and only then builds
+# execd creates the rest of the tree at start-up, because the code that reads
+# these paths is the code that should own creating them.
+RUN mkdir -p /var/lib/jdix/skel /var/lib/jdix/workspace /var/lib/jdix/vol /var/lib/jdix/ipc \
+ && chown -R 1000:1000 /var/lib/jdix \
+ && chmod 700 /var/lib/jdix/ipc \
+ && chmod 0755 /opt/jdix/bin/*
+
+USER 1000:1000
+EXPOSE 8080 8081
+
+# execd is PID 1: it measures the node, waits to be bound, and only then builds
 # the namespace.
 ENTRYPOINT ["/opt/jdix/bin/jdix-execd"]
