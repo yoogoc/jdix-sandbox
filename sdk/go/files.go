@@ -138,7 +138,15 @@ func (s *Sandbox) Signal(ctx context.Context, pid int, sig string) error {
 		"/v1/processes/"+itoa(pid)+"?signal="+url.QueryEscape(sig), nil, nil)
 }
 
-// Expose makes a port inside the sandbox reachable and returns its URL.
+// Expose returns the URL a port inside the sandbox is reachable at.
+//
+// The URL comes from the server, and deliberately is not derived here. How a
+// sandbox is published — a subdomain per sandbox, or a path under one hostname
+// — is the gateway's configuration, and a client that guessed would be right
+// only for whichever scheme it was written against.
+//
+// Any port the sandbox is listening on is already reachable to a caller holding
+// its token. This call reports where; it does not grant anything.
 func (s *Sandbox) Expose(ctx context.Context, port int) (string, error) {
 	var out struct {
 		URL string `json:"url"`
@@ -147,17 +155,10 @@ func (s *Sandbox) Expose(ctx context.Context, port int) (string, error) {
 	if err := s.dataPlane(ctx, http.MethodPost, "/v1/ports", body, &out); err != nil {
 		return "", err
 	}
-	if out.URL != "" {
-		return out.URL, nil
+	if out.URL == "" {
+		return "", &Error{Code: "no_url", Message: "the gateway did not say where this port is published"}
 	}
-	// The gateway derives the hostname from the sandbox id and port, so it can
-	// be built locally when the server does not echo it back.
-	host := strings.TrimPrefix(strings.TrimPrefix(s.Endpoint, "https://"), "http://")
-	name, rest, ok := strings.Cut(host, ".")
-	if !ok {
-		return "", &Error{Code: "no_endpoint", Message: "this sandbox has no published endpoint"}
-	}
-	return "https://" + name + "-" + itoa(port) + "." + rest, nil
+	return out.URL, nil
 }
 
 func itoa(n int) string {

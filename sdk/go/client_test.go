@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -21,6 +22,9 @@ type fakeAPI struct {
 	lastAuth string
 	lastIdem string
 	state    atomic.Value // string
+	// noPortURL makes POST /v1/ports answer without one, which is the case the
+	// SDK must refuse rather than paper over with a guess.
+	noPortURL atomic.Bool
 }
 
 func newFakeAPI(t *testing.T) *fakeAPI {
@@ -28,6 +32,18 @@ func newFakeAPI(t *testing.T) *fakeAPI {
 	f.state.Store("running")
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/ports", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Port int `json:"port"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		var url string
+		if !f.noPortURL.Load() {
+			// What a path-routing gateway answers.
+			url = f.URL + "/s/sbx-test/p/" + strconv.Itoa(req.Port) + "/"
+		}
+		writeJSON(w, 200, map[string]any{"port": req.Port, "url": url})
+	})
 	mux.HandleFunc("POST /v1/sandboxes", func(w http.ResponseWriter, r *http.Request) {
 		f.creates.Add(1)
 		f.lastAuth = r.Header.Get("Authorization")
@@ -330,13 +346,38 @@ func TestKeepAliveMovesTheDeadline(t *testing.T) {
 	}
 }
 
-func TestExposeBuildsThePortHostname(t *testing.T) {
-	sbx := &Sandbox{Endpoint: "https://sbx-abc.sbx.example.com"}
-	host := strings.TrimPrefix(sbx.Endpoint, "https://")
-	name, rest, _ := strings.Cut(host, ".")
-	want := "https://" + name + "-8000." + rest
-	if want != "https://sbx-abc-8000.sbx.example.com" {
-		t.Fatalf("built %q", want)
+// The gateway decides how a sandbox is published, so Expose reports what the
+// server said and never derives a URL of its own. Deriving one was wrong the
+// moment a second routing scheme existed.
+func TestExposeReportsTheServersURL(t *testing.T) {
+	f := newFakeAPI(t)
+	c, err := NewClient(WithAPIKey("jdix_sk_0123456789ab_secret"), WithBaseURL(f.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sbx, err := c.Create(context.Background(), CreateOpts{Template: "py312"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	url, err := sbx.Expose(context.Background(), 8000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if url != f.URL+"/s/sbx-test/p/8000/" {
+		t.Fatalf("Expose returned %q, not what the server answered", url)
+	}
+}
+
+func TestExposeFailsWhenTheServerNamesNoURL(t *testing.T) {
+	f := newFakeAPI(t)
+	f.noPortURL.Store(true)
+	c, _ := NewClient(WithAPIKey("jdix_sk_0123456789ab_secret"), WithBaseURL(f.URL))
+	sbx, err := c.Create(context.Background(), CreateOpts{Template: "py312"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sbx.Expose(context.Background(), 8000); err == nil {
+		t.Fatal("want an error rather than a guessed URL")
 	}
 }
 

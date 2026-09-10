@@ -348,12 +348,20 @@ class Sandbox:
         self._json("DELETE", f"/v1/processes/{int(pid)}?signal={quote(sig)}")
 
     def expose(self, port: int) -> str:
-        """Publish a port and return the URL it is reachable at."""
+        """Return the URL a port inside the sandbox is reachable at.
+
+        The URL comes from the server and is deliberately not derived here. How
+        a sandbox is published — a subdomain per sandbox, or a path under one
+        hostname — is the gateway's configuration, and a client that guessed
+        would be right only for whichever scheme it was written against.
+
+        Any port the sandbox is listening on is already reachable to a caller
+        holding its token. This reports where; it does not grant anything.
+        """
         payload = self._json("POST", "/v1/ports", json={"port": int(port), "public": True})
-        if payload.get("url"):
-            return str(payload["url"])
-        host = self._info.endpoint.split("://", 1)[-1]
-        name, _, rest = host.partition(".")
-        if not rest:
-            raise JdixError("this sandbox has no published endpoint", code="no_endpoint")
-        return f"https://{name}-{int(port)}.{rest}"
+        url = payload.get("url")
+        if not url:
+            raise JdixError(
+                "the gateway did not say where this port is published", code="no_url"
+            )
+        return str(url)

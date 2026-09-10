@@ -284,6 +284,55 @@ paths:
         '403': { $ref: '#/components/responses/PathRefused' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /v1/ports:
+    post:
+      operationId: exposePort
+      tags: [lifecycle]
+      summary: Report where a port inside the sandbox is published
+      description: |
+        Answered by jdix-gateway, not forwarded into the sandbox: the answer is
+        a URL, and nothing ever tells execd what hostname or routing scheme it
+        is published under.
+
+        This grants nothing. Every port the sandbox is listening on is already
+        reachable to a caller holding its token; the call reports where.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [port]
+              properties:
+                port:
+                  type: integer
+                  minimum: 1
+                  maximum: 65535
+                  description: The port the sandbox is listening on.
+                public:
+                  type: boolean
+                  default: true
+      responses:
+        '200':
+          description: Where the port is reachable.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [port, url]
+                properties:
+                  port: { type: integer }
+                  url:
+                    type: string
+                    format: uri
+                    description: Absolute URL, ready to open or hand to a user.
+        '400':
+          description: Not a port, or the sandbox's own data-plane port.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
   /v1/keepalive:
     post:
       operationId: keepAlive

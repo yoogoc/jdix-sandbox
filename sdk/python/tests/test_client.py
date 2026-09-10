@@ -33,6 +33,7 @@ class _State:
         self.last_idem = ""
         self.last_exec: Dict[str, Any] = {}
         self.deletes = 0
+        self.no_port_url = False
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -127,7 +128,13 @@ class _Handler(BaseHTTPRequestHandler):
         elif url.path == "/v1/keepalive":
             self._send(200, {"ok": True, "expiresAt": "2031-01-01T00:00:00Z"})
         elif url.path == "/v1/ports":
-            self._send(200, {"ok": True})
+            if self.state.no_port_url:
+                self._send(200, {"port": body.get("port")})
+            else:
+                self._send(200, {
+                    "port": body.get("port"),
+                    "url": f"http://{self.headers['Host']}/s/sbx-test/p/{body.get('port')}/",
+                })
         else:
             self._send(404, {"code": "not_found", "message": self.path})
 
@@ -296,17 +303,19 @@ def test_keep_alive_moves_the_deadline(client):
     assert sbx.expires_at > before
 
 
-def test_expose_builds_the_port_hostname():
-    from jdix._models import SandboxInfo
-    from jdix._sandbox import Sandbox
+def test_expose_reports_the_servers_url(client):
+    """The gateway decides how a sandbox is published, so the SDK reports what
+    it said rather than deriving a URL that only suits one routing scheme."""
+    sbx = client.create("py312")
+    assert sbx.expose(8000).endswith("/s/sbx-test/p/8000/")
 
-    info = SandboxInfo(id="sbx-abc", state="running", template="t",
-                       endpoint="https://sbx-abc.sbx.example.com")
-    sbx = Sandbox.__new__(Sandbox)
-    sbx._info = info
-    host = info.endpoint.split("://", 1)[-1]
-    name, _, rest = host.partition(".")
-    assert f"https://{name}-8000.{rest}" == "https://sbx-abc-8000.sbx.example.com"
+
+def test_expose_fails_when_the_server_names_no_url(client, server):
+    _, state = server
+    state.no_port_url = True
+    sbx = client.create("py312")
+    with pytest.raises(JdixError):
+        sbx.expose(8000)
 
 
 def test_templates(client):
