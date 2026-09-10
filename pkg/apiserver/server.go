@@ -133,7 +133,6 @@ type SandboxResponse struct {
 	Template      string     `json:"template"`
 	IsolationTier string     `json:"isolationTier,omitempty"`
 	Endpoint      string     `json:"endpoint,omitempty"`
-	Token         string     `json:"token,omitempty"`
 	ExpiresAt     *time.Time `json:"expiresAt,omitempty"`
 	ColdStart     bool       `json:"coldStart"`
 	Reason        string     `json:"reason,omitempty"`
@@ -252,7 +251,6 @@ func (s *Server) respondWithSandbox(w http.ResponseWriter, r *http.Request, p *P
 		return
 	}
 	resp := toResponse(sbx)
-	resp.Token = sbx.Status.Token
 	code := http.StatusCreated
 	if sbx.Status.Phase == sbxv1.PhaseFailed {
 		// The sandbox exists and its object records why it failed, so this is a
@@ -331,13 +329,7 @@ func (s *Server) getSandbox(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "not_found", "no such sandbox")
 		return
 	}
-	resp := toResponse(&sbx)
-	// Returned here as well as from create, so a caller that lost the token can
-	// reattach to a sandbox it owns. The list endpoint deliberately does not:
-	// one credential per response is a smaller thing to leak into a log than
-	// every credential the tenant holds.
-	resp.Token = sbx.Status.Token
-	writeJSON(w, http.StatusOK, resp)
+	writeJSON(w, http.StatusOK, toResponse(&sbx))
 }
 
 func (s *Server) listSandboxes(w http.ResponseWriter, r *http.Request) {

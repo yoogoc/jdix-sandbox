@@ -105,7 +105,6 @@ class SandboxInfo:
     template: str
     isolation_tier: str = ""
     endpoint: str = ""
-    token: str = ""
     expires_at: Optional[datetime] = None
     cold_start: bool = False
     reason: str = ""

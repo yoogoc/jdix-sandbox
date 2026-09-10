@@ -71,7 +71,7 @@ func main() {
 
 		// Control plane, for --role=server and --role=all.
 		addr      = flag.String("addr", ":8000", "control-plane listen address")
-		dsn       = flag.String("database-url", os.Getenv("DATABASE_URL"), "Postgres connection string; empty uses an in-memory store")
+		dsn       = flag.String("database-url", os.Getenv("DATABASE_URL"), "Postgres connection string; empty uses an in-memory store. Needed by both roles: the data plane authenticates the same API key as the control plane")
 		migrate   = flag.Bool("migrate", true, "apply the schema at start-up (idempotent)")
 		devSeed   = flag.Bool("dev-seed", false, "create a demo tenant and print an API key; in-memory store only")
 		readyWait = flag.Duration("ready-timeout", 8*time.Second, "how long create waits before returning a pending sandbox")
@@ -127,21 +127,26 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Both roles need the store now: the data plane authenticates the same API
+	// key as the control plane, and checking one means reading the argon2id
+	// hash it is compared against. That is the cost of having one credential
+	// instead of two, and it is why --role=gateway is no longer stateless.
+	store, closeStore, err := openStore(ctx, *dsn, *migrate, *devSeed, log)
+	if err != nil {
+		log.Error("opening the store", "err", err)
+		os.Exit(1)
+	}
+	defer closeStore()
+	auth := apiserver.NewAuthenticator(store)
+
 	var listeners []*listener
 
 	if r.control {
-		store, closeStore, err := openStore(ctx, *dsn, *migrate, *devSeed, log)
-		if err != nil {
-			log.Error("opening the store", "err", err)
-			os.Exit(1)
-		}
-		defer closeStore()
-
 		srv := &apiserver.Server{
 			Client:       kube,
 			APIReader:    reader,
 			Store:        store,
-			Auth:         apiserver.NewAuthenticator(store),
+			Auth:         auth,
 			Log:          log,
 			ReadyTimeout: *readyWait,
 		}
@@ -179,7 +184,8 @@ func main() {
 			server: &http.Server{
 				Addr: *dataAddr,
 				Handler: (&gateway.Server{
-					Resolver: cached, Router: router, Transport: transport, Log: log,
+					Resolver: cached, Router: router, Transport: transport,
+					Auth: dataPlaneAuth{auth}, Log: log,
 				}).Handler(),
 				ReadHeaderTimeout: 15 * time.Second,
 				// No write timeout: PTY sessions and exec streams are long-lived
@@ -196,6 +202,29 @@ func main() {
 	}
 	log.Info("stopped")
 }
+
+// dataPlaneAuth adapts the control plane's authenticator to what the gateway
+// needs, which is deliberately less: a tenant id and a yes or no.
+//
+// The scope asked for is sandbox:read rather than a new one. Reaching a
+// sandbox's data plane is the same power as being allowed to look at it — a key
+// that can list your sandboxes can already delete them if it carries
+// sandbox:delete — and inventing a scope here would only mean existing keys
+// silently stopped working.
+type dataPlaneAuth struct{ *apiserver.Authenticator }
+
+func (a dataPlaneAuth) Verify(ctx context.Context, presented, clientIP string) (gateway.Caller, error) {
+	p, err := a.Authenticator.Verify(ctx, presented, clientIP)
+	if err != nil {
+		return gateway.Caller{}, err
+	}
+	return gateway.Caller{
+		TenantID: p.TenantID,
+		MayUse:   p.Key.Allows(apiserver.ScopeSandboxRead),
+	}, nil
+}
+
+func (a dataPlaneAuth) Deny(w http.ResponseWriter, err error) { apiserver.WriteAuthError(w, err) }
 
 // transportKind names a way of reaching a sandbox Pod. It is parsed before
 // anything opens a socket and turned into a Transport afterwards, because

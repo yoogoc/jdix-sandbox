@@ -94,6 +94,7 @@ func newProxyGateway(t *testing.T, api *fakeAPIServer, target Target) *httptest.
 		Resolver:  stubResolver{targets: map[string]Target{target.SandboxID: target}},
 		Router:    PathRouter{},
 		Transport: transport,
+		Auth:      stubAuth{},
 		Log:       slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 	ts := httptest.NewServer(srv.Handler())
@@ -102,13 +103,9 @@ func newProxyGateway(t *testing.T, api *fakeAPIServer, target Target) *httptest.
 }
 
 func boundTarget(id string) Target {
-	return Target{
-		SandboxID: id,
-		Namespace: "tenant-abc",
-		PodName:   "warm-1",
-		PodIP:     "10.0.0.9", // present, and deliberately unroutable from here
-		ExpiresAt: time.Now().Add(time.Hour),
-	}
+	// PodIP is present and deliberately unroutable from here: this transport
+	// must not be quietly dialling it.
+	return bound(id, "10.0.0.9")
 }
 
 func TestAPIProxyTransportReachesTheSandboxThroughTheAPIServer(t *testing.T) {
@@ -156,8 +153,11 @@ func TestAPIProxyTransportMovesTheTokenOffAuthorization(t *testing.T) {
 	if fake.lastAuth != "Bearer kube-token" {
 		t.Errorf("the API server was given %q; the gateway's own credential did not survive", fake.lastAuth)
 	}
-	if sawToken != "sbt_token" {
-		t.Errorf("the sandbox was given %q in %s, want the sandbox token", sawToken, api.ControlTokenHeader)
+	if sawToken != podToken {
+		t.Errorf("the sandbox was given %q in %s, want the per-sandbox token", sawToken, api.ControlTokenHeader)
+	}
+	if strings.Contains(sawToken, testKey) {
+		t.Error("the tenant's API key reached the sandbox")
 	}
 	if sawAuth != "" {
 		t.Errorf("Authorization reached the sandbox as %q; the real API server strips it, so relying on it is a 401 in production only", sawAuth)
@@ -212,7 +212,7 @@ func TestAPIProxyTransportProxiesWebSockets(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	c, _, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(gw.URL, "http")+"/s/sbx-abc/v1/pty",
-		&websocket.DialOptions{HTTPHeader: http.Header{"Authorization": {"Bearer sbt_token"}}})
+		&websocket.DialOptions{HTTPHeader: http.Header{"Authorization": {"Bearer " + testKey}}})
 	if err != nil {
 		t.Fatalf("dialling through the pod proxy: %v", err)
 	}
@@ -249,9 +249,9 @@ func TestAPIProxyTransportRefusesASandboxWithNoPodName(t *testing.T) {
 	}
 }
 
-// The direct transport is unaffected by any of the above: it still forwards
-// Authorization, which is what execd reads when it is dialled straight.
-func TestDirectTransportStillForwardsAuthorization(t *testing.T) {
+// Both transports withhold the caller's credential; they differ only in which
+// header they put the sandbox's own token in.
+func TestDirectTransportWithholdsTheCallersKeyFromAUserPort(t *testing.T) {
 	be := newPathBackend(t)
 	var sawAuth string
 	be.respond = func(w http.ResponseWriter, r *http.Request) {
@@ -262,7 +262,7 @@ func TestDirectTransportStillForwardsAuthorization(t *testing.T) {
 	resp := get(t, gw, "/s/sbx-abc/p/"+itoa(port)+"/")
 	resp.Body.Close()
 
-	if sawAuth != "Bearer sbt_token" {
-		t.Errorf("Authorization arrived as %q; execd reads it when dialled directly", sawAuth)
+	if sawAuth != "" {
+		t.Errorf("a user port was handed %q", sawAuth)
 	}
 }

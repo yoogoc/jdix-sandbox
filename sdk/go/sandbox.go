@@ -68,7 +68,6 @@ type sandboxJSON struct {
 	Template      string     `json:"template"`
 	IsolationTier string     `json:"isolationTier"`
 	Endpoint      string     `json:"endpoint"`
-	Token         string     `json:"token"`
 	ExpiresAt     *time.Time `json:"expiresAt"`
 	ColdStart     bool       `json:"coldStart"`
 	Reason        string     `json:"reason"`
@@ -89,7 +88,6 @@ type Sandbox struct {
 	Files *Files
 
 	client *Client
-	token  string
 
 	mu        sync.RWMutex
 	state     string
@@ -157,7 +155,6 @@ func (c *Client) newSandbox(j *sandboxJSON) *Sandbox {
 		Endpoint:      j.Endpoint,
 		ColdStart:     j.ColdStart,
 		client:        c,
-		token:         j.Token,
 		state:         j.State,
 		expiresAt:     j.ExpiresAt,
 	}

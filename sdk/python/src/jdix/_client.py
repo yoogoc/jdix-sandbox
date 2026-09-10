@@ -71,12 +71,11 @@ class Transport:
         content: Any = None,
         headers: Optional[Dict[str, str]] = None,
         base: Optional[str] = None,
-        token: Optional[str] = None,
         stream_response: bool = False,
     ) -> httpx.Response:
         url = (base or self.base_url).rstrip("/") + path
         merged = {
-            "Authorization": f"Bearer {token or self.api_key}",
+            "Authorization": f"Bearer {self.api_key}",
             "User-Agent": USER_AGENT,
         }
         if headers:

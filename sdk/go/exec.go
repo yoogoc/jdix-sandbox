@@ -186,7 +186,7 @@ func (s *Sandbox) openStream(ctx context.Context, path string, q url.Values) (*S
 
 	streamCtx, cancel := context.WithCancel(ctx)
 	conn, _, err := websocket.Dial(streamCtx, wsURL, &websocket.DialOptions{
-		HTTPHeader: http.Header{"Authorization": {"Bearer " + s.token}},
+		HTTPHeader: http.Header{"Authorization": {"Bearer " + s.client.apiKey}},
 	})
 	if err != nil {
 		cancel()
@@ -276,7 +276,7 @@ func (s *Sandbox) dataPlane(ctx context.Context, method, path string, body, out 
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+s.token)
+	req.Header.Set("Authorization", "Bearer "+s.client.apiKey)
 	req.Header.Set("User-Agent", s.client.userAgent)
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")

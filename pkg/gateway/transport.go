@@ -49,6 +49,9 @@ func (DirectTransport) Rewrite(pr *httputil.ProxyRequest, t Target, rt Route) {
 	// application inside it can generate URLs that work.
 	pr.Out.Host = pr.In.Host
 	pr.Out.URL.Path, pr.Out.URL.RawPath = rt.Rest, rt.RawRest
+	presentToken(pr, t, rt, func(token string) {
+		pr.Out.Header.Set("Authorization", "Bearer "+token)
+	})
 }
 
 // APIProxyTransport reaches a sandbox through the Kubernetes API server's pod
@@ -121,19 +124,43 @@ func (a *APIProxyTransport) Rewrite(pr *httputil.ProxyRequest, t Target, rt Rout
 	// Host stays the API server's: SetURL cleared it, and overriding it with
 	// the client's would send the API server a name it does not answer to.
 
-	// Authorization must go, for two reasons that both end in a 401. The API
-	// server strips it before forwarding, so the sandbox would never see the
-	// token anyway; and client-go's transport declines to overwrite an
-	// Authorization header that is already set, so the sandbox's token would be
-	// presented to the API server as this gateway's own credential.
-	token := bearer(pr.In)
-	pr.Out.Header.Del("Authorization")
-	if token != "" && !rt.UserPort {
+	// Authorization must go regardless. The API server strips it before
+	// forwarding, so nothing put there would arrive; and client-go's transport
+	// declines to overwrite an Authorization header that is already set, so
+	// leaving one would present it to the API server as this gateway's own
+	// credential. Either way, a 401 nowhere near its cause.
+	presentToken(pr, t, rt, func(token string) {
 		// execd accepts the token here precisely because Authorization cannot
-		// survive the hop. A tenant's own application on a user port has no
-		// such arrangement, so it is not given one.
+		// survive the hop.
 		pr.Out.Header.Set(api.ControlTokenHeader, token)
+	})
+}
+
+// presentToken replaces the caller's credential with the sandbox's own.
+//
+// The caller authenticated to the gateway with the tenant's API key, which is a
+// credential for the whole account: it can create and destroy every sandbox the
+// tenant has. It must not travel any further than the gateway. What execd is
+// given instead is the per-sandbox token it was told to honour at bind — worth
+// one sandbox until its TTL runs out, and useless anywhere else.
+//
+// This matters most on a user port, where the far end is the tenant's own web
+// application, which is to say the untrusted code the sandbox exists to run.
+// That code is handed nothing.
+func presentToken(pr *httputil.ProxyRequest, t Target, rt Route, set func(string)) {
+	pr.Out.Header.Del("Authorization")
+	pr.Out.Header.Del(api.ControlTokenHeader)
+	// The credential may also have arrived in the query string, which browsers
+	// need for WebSockets. Strip it there too, or it rides into the sandbox in
+	// the URL and lands in whatever the application logs.
+	if q := pr.Out.URL.Query(); q.Has("token") {
+		q.Del("token")
+		pr.Out.URL.RawQuery = q.Encode()
 	}
+	if rt.UserPort || t.Token == "" {
+		return
+	}
+	set(t.Token)
 }
 
 var (

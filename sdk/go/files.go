@@ -40,7 +40,7 @@ func (f *Files) Open(ctx context.Context, path string) (io.ReadCloser, error) {
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+f.sbx.token)
+	req.Header.Set("Authorization", "Bearer "+f.sbx.client.apiKey)
 
 	resp, err := f.sbx.client.http.Do(req)
 	if err != nil {
@@ -73,7 +73,7 @@ func (f *Files) Write(ctx context.Context, path string, content io.Reader) error
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+f.sbx.token)
+	req.Header.Set("Authorization", "Bearer "+f.sbx.client.apiKey)
 	req.Header.Set("Content-Type", "application/octet-stream")
 
 	resp, err := f.sbx.client.http.Do(req)
@@ -146,7 +146,7 @@ func (s *Sandbox) Signal(ctx context.Context, pid int, sig string) error {
 // only for whichever scheme it was written against.
 //
 // Any port the sandbox is listening on is already reachable to a caller holding
-// its token. This call reports where; it does not grant anything.
+// the tenant's API key. This call reports where; it does not grant anything.
 func (s *Sandbox) Expose(ctx context.Context, port int) (string, error) {
 	var out struct {
 		URL string `json:"url"`

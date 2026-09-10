@@ -2,6 +2,7 @@ package apiserver
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/http"
 	"strings"
@@ -87,50 +88,76 @@ func (a *Authenticator) lookup(ctx context.Context, keyID string) (*APIKey, *Ten
 	return key, tenant, nil
 }
 
-// Authenticate is the middleware. Every failure returns the same 401 with the
-// same body: distinguishing "no such key" from "wrong secret" would turn the
+// ErrUnauthenticated is every way a credential can fail to resolve, collapsed
+// into one. Distinguishing "no such key" from "wrong secret" would turn the
 // endpoint into an oracle for enumerating key ids.
+var ErrUnauthenticated = errors.New("invalid or missing API key")
+
+// Verify resolves a presented API key to the caller it belongs to.
+//
+// It exists separately from the middleware because the data plane authenticates
+// the same credential without being an http.Handler chain: jdix-server's gateway
+// role checks an API key on a request it is about to reverse-proxy, not one it
+// is about to serve.
+func (a *Authenticator) Verify(ctx context.Context, presented, clientIP string) (*Principal, error) {
+	if presented == "" {
+		return nil, ErrUnauthenticated
+	}
+	keyID, secret, err := ParseKey(presented)
+	if err != nil {
+		return nil, ErrUnauthenticated
+	}
+	key, tenant, err := a.lookup(ctx, keyID)
+	if err != nil {
+		return nil, ErrUnauthenticated
+	}
+	if !VerifySecret(secret, key.SecretHash) {
+		return nil, ErrUnauthenticated
+	}
+	if err := key.Valid(a.now()); err != nil {
+		// Revoked and expired are worth distinguishing: the caller holds a key
+		// that really was theirs, and a vague error sends them hunting for a bug
+		// that is not there.
+		return nil, err
+	}
+	if !ipAllowed(key.IPAllowlist, clientIP) {
+		return nil, ErrIPNotAllowed
+	}
+
+	// Best effort: last-used is for the Console, never for a decision, so a
+	// write failure must not fail the request.
+	_ = a.Store.TouchAPIKey(ctx, keyID, a.now())
+
+	return &Principal{TenantID: tenant.ID, Namespace: tenant.Namespace, KeyID: keyID, Key: key}, nil
+}
+
+// ErrIPNotAllowed is a valid key presented from an address it is not allowed
+// from, which is worth saying out loud rather than reporting as a bad key.
+var ErrIPNotAllowed = errors.New("this API key may only be used from its allowlisted addresses")
+
+// Authenticate is the middleware over Verify.
 func (a *Authenticator) Authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		presented := bearerToken(r)
-		if presented == "" {
-			unauthorized(w)
-			return
-		}
-		keyID, secret, err := ParseKey(presented)
+		p, err := a.Verify(r.Context(), bearerToken(r), clientIP(r))
 		if err != nil {
-			unauthorized(w)
+			WriteAuthError(w, err)
 			return
 		}
-		key, tenant, err := a.lookup(r.Context(), keyID)
-		if err != nil {
-			unauthorized(w)
-			return
-		}
-		if !VerifySecret(secret, key.SecretHash) {
-			unauthorized(w)
-			return
-		}
-		if err := key.Valid(a.now()); err != nil {
-			// Revoked and expired are worth distinguishing: the caller holds a
-			// key that really was theirs, and a vague error sends them hunting
-			// for a bug that is not there.
-			writeErr(w, http.StatusUnauthorized, "key_"+strings.TrimPrefix(err.Error(), "API key "), err.Error())
-			return
-		}
-		if !ipAllowed(key.IPAllowlist, clientIP(r)) {
-			writeErr(w, http.StatusForbidden, "ip_not_allowed",
-				"this API key may only be used from its allowlisted addresses")
-			return
-		}
-
-		// Best effort: last-used is for the Console, never for a decision, so a
-		// write failure must not fail the request.
-		_ = a.Store.TouchAPIKey(r.Context(), keyID, a.now())
-
-		p := &Principal{TenantID: tenant.ID, Namespace: tenant.Namespace, KeyID: keyID, Key: key}
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), principalKey{}, p)))
 	})
+}
+
+// WriteAuthError renders a Verify failure, so the two planes answer alike.
+func WriteAuthError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, ErrIPNotAllowed):
+		writeErr(w, http.StatusForbidden, "ip_not_allowed", err.Error())
+	case errors.Is(err, ErrKeyRevoked), errors.Is(err, ErrKeyExpired):
+		writeErr(w, http.StatusUnauthorized,
+			"key_"+strings.TrimPrefix(err.Error(), "API key "), err.Error())
+	default:
+		unauthorized(w)
+	}
 }
 
 // RequireScope guards a route.

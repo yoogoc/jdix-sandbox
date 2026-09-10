@@ -98,10 +98,9 @@ class Client:
     def get(self, sandbox_id: str) -> "Sandbox":
         """Fetch an existing sandbox, ready to execute against.
 
-        The data-plane token comes back with it, so a process that lost the one
-        from ``create`` — a restart, another worker picking up the job — can
-        reattach by id alone. ``list`` does not carry tokens; use ``get`` for
-        the ones you mean to use.
+        There is no second credential to carry: the data plane takes the same
+        API key as the control plane, so a sandbox fetched by id is immediately
+        usable.
         """
         payload = self._t.json("GET", f"/v1/sandboxes/{quote(sandbox_id)}")
         return Sandbox(self._t, _info_from_json(payload))
@@ -136,7 +135,6 @@ def _info_from_json(payload: Dict[str, Any]) -> SandboxInfo:
         template=payload.get("template", ""),
         isolation_tier=payload.get("isolationTier", ""),
         endpoint=payload.get("endpoint", ""),
-        token=payload.get("token", ""),
         expires_at=_parse_time(payload.get("expiresAt")),
         cold_start=bool(payload.get("coldStart")),
         reason=payload.get("reason", ""),
@@ -197,7 +195,7 @@ class Sandbox:
                 code="not_ready",
             )
         return self._t.request(
-            method, path, base=self._info.endpoint, token=self._info.token, **kwargs
+            method, path, base=self._info.endpoint, **kwargs
         )
 
     def _json(self, method: str, path: str, **kwargs: Any) -> Any:
@@ -222,7 +220,6 @@ class Sandbox:
         while True:
             payload = self._t.json("GET", f"/v1/sandboxes/{quote(self._info.id)}")
             fresh = _info_from_json(payload)
-            fresh.token = fresh.token or self._info.token
             self._info = fresh
             if fresh.state == "running":
                 return self
@@ -357,7 +354,8 @@ class Sandbox:
         would be right only for whichever scheme it was written against.
 
         Any port the sandbox is listening on is already reachable to a caller
-        holding its token. This reports where; it does not grant anything.
+        holding the tenant's API key. This reports where; it does not grant
+        anything.
         """
         payload = self._json("POST", "/v1/ports", json={"port": int(port), "public": True})
         url = payload.get("url")

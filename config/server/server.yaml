@@ -133,4 +133,8 @@ spec:
 #
 # and give each its own Service. The Ingress in this directory routes by path,
 # so it keeps working with either shape — only the backend service names change.
-# A --role=gateway Pod needs no DATABASE_URL: it never opens the store.
+#
+# Both roles need DATABASE_URL. The data plane authenticates the tenant's API
+# key, the same one the control plane takes, and checking a key means reading
+# the argon2id hash it is compared against. That is the cost of having one
+# credential instead of two.

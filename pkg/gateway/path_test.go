@@ -152,11 +152,10 @@ func newPathGateway(t *testing.T, id string, be *pathBackend) (*httptest.Server,
 	t.Helper()
 	ip, port := hostPortOf(t, be.Server)
 	srv := &Server{
-		Resolver: stubResolver{targets: map[string]Target{
-			id: {SandboxID: id, PodIP: ip, ExpiresAt: time.Now().Add(time.Hour)},
-		}},
-		Router: PathRouter{},
-		Log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Resolver: stubResolver{targets: map[string]Target{id: bound(id, ip)}},
+		Router:   PathRouter{},
+		Auth:     stubAuth{},
+		Log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
@@ -171,7 +170,7 @@ func get(t *testing.T, gw *httptest.Server, path string) *http.Response {
 	if err != nil {
 		t.Fatal(err)
 	}
-	req.Header.Set("Authorization", "Bearer sbt_token")
+	req.Header.Set("Authorization", "Bearer "+testKey)
 	client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
 		return http.ErrUseLastResponse
 	}}
@@ -297,7 +296,7 @@ func TestExposeAnswersWithARoutableURL(t *testing.T) {
 
 	req, _ := http.NewRequest(http.MethodPost, gw.URL+"/s/sbx-abc/v1/ports",
 		strings.NewReader(`{"port":8000,"public":true}`))
-	req.Header.Set("Authorization", "Bearer sbt_token")
+	req.Header.Set("Authorization", "Bearer "+testKey)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -332,7 +331,7 @@ func TestExposeRefusesTheDataPlanePort(t *testing.T) {
 
 	req, _ := http.NewRequest(http.MethodPost, gw.URL+"/s/sbx-abc/v1/ports",
 		strings.NewReader(`{"port":8080}`))
-	req.Header.Set("Authorization", "Bearer sbt_token")
+	req.Header.Set("Authorization", "Bearer "+testKey)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -399,7 +398,7 @@ func TestGatewayProxiesWebSocketsUnderAPrefix(t *testing.T) {
 	wsURL := "ws" + strings.TrimPrefix(gw.URL, "http") +
 		"/s/sbx-abc/p/" + strconv.Itoa(port) + "/v1/pty"
 	c, _, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
-		HTTPHeader: http.Header{"Authorization": {"Bearer sbt_token"}},
+		HTTPHeader: http.Header{"Authorization": {"Bearer " + testKey}},
 	})
 	if err != nil {
 		t.Fatalf("dialing %s: %v", wsURL, err)

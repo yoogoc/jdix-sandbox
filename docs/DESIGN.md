@@ -658,13 +658,27 @@ POST   /v1/keepalive             续期 TTL
 GET    /v1/health                存活 + 资源用量快照
 ```
 
-### 7.3.1 数据面 token 的去处
+### 7.3.1 数据面认证：与控制面同一个 API key
 
-controller 在 bind 时 mint token 交给 execd，同时写进 `status.token`，apiserver 从那里读出来返回给租户。**必须两边一致**，否则租户拿到的凭据沙箱不认——曾经 controller mint 完就丢，`status` 里根本没有这个字段，于是每一次数据面调用都是 `invalid or missing sandbox token`，而错误信息（故意含糊，避免被当成沙箱是否存在的探针）完全指不到病根。现在有测试直接断言"给 execd 的"和"写进 status 的"是同一个值。
+调用方对数据面出示的就是租户的 API key（`jdix_sk_…`），和控制面同一个。**没有第二个凭据**。
 
-**明文存 etcd 是个明摆着的取舍。** mint 它的是 controller（bind 才是沙箱获得身份的时刻），交给租户的是 apiserver，两者之间任何一条路都要经过一个被持久化的对象——所以"发出去但不存"不在选项里，能做的是把它存在哪儿说清楚。读它需要租户 namespace 下 sandboxes 的 get 权限，而租户没有这个权限（他们只能走 API）。这和 Pod spec 里明文躺着的控制面 token 是同一笔交易（§04）。沙箱过期或失败时立即清空——那时它已经什么都认证不了了。
+gateway 做三件事，然后才转发：
 
-**返回位置是个决定，不是巧合**：`createSandbox` 和 `getSandbox` 返回（后者让丢了 token 的进程能按 id 重新接上），`listSandboxes` 不返回——一次响应泄漏一个凭据，比泄漏该租户手上全部凭据要小。
+1. 用控制面同一个 `Authenticator` 验 key（argon2id + 60s 缓存）。
+2. 检查这个 key 的租户**确实拥有**这个沙箱。API key 是租户级的，少了这一步任何 key 都能打开集群里任何沙箱——这是本方案唯一不能省的检查。
+3. 把调用方的凭据**换成沙箱自己的 token**（`status.token`，来自 informer cache），再进 Pod。Authorization 头、`X-Jdix-Control-Token`、query 里的 `token=` 全部先清掉。
+
+第 3 步是关键：execd 仍然验一个它自己能验的凭据（它连不到 Postgres，也不该连），所以"gateway 与 execd 各查一次"这个性质保住了；同时**租户的 API key 永远不会进入沙箱**。用户端口那条路尤其重要——那头是租户自己的 web 应用，也就是沙箱存在的意义所在的那些不可信代码，它什么凭据都拿不到。
+
+`status.token` 因此变成纯内部机制，租户看不到，任何 API 响应里都没有。它明文存 etcd：读它要租户 namespace 下 sandboxes 的 get 权限，租户没有；这和 Pod spec 里明文躺着的控制面 token 是同一笔交易（§04）。沙箱过期或失败时清空。
+
+需要的 scope 是 `sandbox:read`，不新增——能列出你的沙箱和能用你的沙箱是同一种权力，新造一个只会让现有 key 悄悄失效。
+
+**记下这个方案的代价**（决定是明确做出的，不是没看见）：
+
+- **`--role=gateway` 不再是无状态的**，必须连 Postgres 才能验 key。拆分部署时两个 role 都要 `DATABASE_URL`。
+- **爆炸半径变大**。per-sandbox token 泄漏只丢一个沙箱一个 TTL；API key 泄漏丢的是整个账号（能创建/删除该租户全部沙箱）。而 `?token=` 是浏览器 WS 必须走的路径，这个凭据一定会进 URL、反代日志，走 pod proxy 时还会进 API server 审计日志。
+- **凭据生命周期与沙箱脱钩**。沙箱销毁不再自动作废任何东西，只能靠吊销 key，而吊销有 60s 缓存窗口。
 
 ### 7.4 execd 控制面 API（集群内，`:8081`）
 

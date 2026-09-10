@@ -38,7 +38,7 @@ class ExecStream:
         # still allows the synchronous API to work.
         from websockets.sync.client import connect
 
-        headers = {"Authorization": f"Bearer {self._sbx._info.token}"}
+        headers = {"Authorization": f"Bearer {self._sbx._t.api_key}"}
         with connect(self._ws_url(), additional_headers=headers, max_size=32 * 1024 * 1024) as ws:
             for raw in ws:
                 frame = json.loads(raw)

@@ -69,6 +69,12 @@ case "$COMPONENT" in
   server|apiserver|gateway)
     # No --database-url: the in-memory store plus --dev-seed prints a usable API
     # key on start-up, so there is nothing to provision before the first call.
+    #
+    # Prefer `server` when you want to make calls. The data plane authenticates
+    # the same API key as the control plane, so running `apiserver` and
+    # `gateway` as two processes gives them two in-memory stores and two
+    # different dev keys — the one printed by `apiserver` will not open a
+    # sandbox through `gateway`. Split them only with a real --database-url.
     # Path routing needs no DNS locally either — the sandbox id is in the URL,
     # so http://127.0.0.1:8090/s/<id>/v1/exec works straight from curl.
     case "$COMPONENT" in

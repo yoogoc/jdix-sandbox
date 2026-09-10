@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -242,14 +243,12 @@ func TestCreateWaitsForTheControllerToFinish(t *testing.T) {
 	if got.Endpoint == "" || got.ExpiresAt == nil || got.IsolationTier != string(sbxv1.TierUserns) {
 		t.Fatalf("a ready sandbox must carry everything the SDK needs: %+v", got)
 	}
-	if got.Token != "sbt_from_the_controller" {
-		t.Fatalf("token %q: without it the endpoint above is unusable and every data-plane call is a 401", got.Token)
-	}
 }
 
-// The token is a credential, so where it appears is a decision rather than an
-// accident: on the two single-sandbox reads, and not in a bulk listing.
-func TestTokenIsReturnedByGetButNotByList(t *testing.T) {
+// The data plane takes the same API key as the control plane, so no response
+// here carries a second credential. The sandbox's own token stays on the object
+// for the gateway to swap in, and never reaches a tenant.
+func TestResponsesCarryNoSandboxToken(t *testing.T) {
 	f := newFixture(t)
 	f.srv.ReadyTimeout = time.Millisecond
 
@@ -266,24 +265,13 @@ func TestTokenIsReturnedByGetButNotByList(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	one := decode[SandboxResponse](t, f.do(http.MethodGet, "/v1/sandboxes/"+id, f.key, nil))
-	if one.Token != "sbt_from_the_controller" {
-		t.Errorf("get returned token %q; a caller that lost it cannot reattach", one.Token)
-	}
-
-	var listed struct {
-		Sandboxes []SandboxResponse `json:"sandboxes"`
-	}
-	body := f.do(http.MethodGet, "/v1/sandboxes", f.key, nil)
-	defer body.Body.Close()
-	if err := json.NewDecoder(body.Body).Decode(&listed); err != nil {
-		t.Fatal(err)
-	}
-	if len(listed.Sandboxes) != 1 {
-		t.Fatalf("listed %d sandboxes", len(listed.Sandboxes))
-	}
-	if listed.Sandboxes[0].Token != "" {
-		t.Errorf("list leaked a credential: %q", listed.Sandboxes[0].Token)
+	for _, path := range []string{"/v1/sandboxes/" + id, "/v1/sandboxes"} {
+		body := f.do(http.MethodGet, path, f.key, nil)
+		raw, _ := io.ReadAll(body.Body)
+		body.Body.Close()
+		if strings.Contains(string(raw), "sbt_from_the_controller") {
+			t.Errorf("GET %s handed the caller the sandbox's own token: %s", path, raw)
+		}
 	}
 }
 

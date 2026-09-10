@@ -19,7 +19,12 @@ info:
   summary: Run commands and move files inside one sandbox.
   description: |
     Every request here concerns exactly one sandbox: the `endpoint` identifies
-    it and the bearer token authorises it. There is no path parameter for the
+    it and the tenant's API key authorises it — the same credential the control
+    plane takes, so there is no second token to carry.
+
+    The gateway checks the key, checks that the sandbox belongs to the tenant it
+    belongs to, and swaps in a per-sandbox credential for the hop into the Pod.
+    The API key itself never reaches a sandbox. There is no path parameter for the
     sandbox, because there is nothing else this endpoint could be about.
 
     Streaming endpoints upgrade to WebSocket. OpenAPI has no way to describe a
@@ -365,16 +370,19 @@ components:
       type: http
       scheme: bearer
       description: |
-        `Authorization: Bearer sbt_…`, the token returned once by
-        `createSandbox`.
+        `Authorization: Bearer jdix_sk_…`, the tenant's API key — the same
+        credential the control plane takes.
 
-        It is checked twice: by the gateway and again by execd. A misconfigured
-        NetworkPolicy that let something reach a Pod directly should not be the
-        only thing between a stranger and a shell.
+        The gateway verifies it, checks the sandbox belongs to that tenant, and
+        replaces it with a per-sandbox credential before the request enters the
+        Pod. So it is still checked twice, by the gateway and again by execd: a
+        misconfigured NetworkPolicy that let something reach a Pod directly
+        should not be the only thing between a stranger and a shell.
 
         A WebSocket opened from a browser cannot set headers, so `?token=` is
-        accepted for those. Prefer the header everywhere else: query strings end
-        up in logs.
+        accepted for those. Prefer the header everywhere else, and note that
+        this is an account-wide credential: a query string that ends up in a
+        proxy log is worth more here than a per-sandbox token would have been.
 
   parameters:
     Path:

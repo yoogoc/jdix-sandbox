@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net"
 	"net/http"
@@ -28,6 +29,14 @@ type Target struct {
 	Namespace string
 	PodName   string
 	PodIP     string
+	// TenantID is who owns the sandbox. The gateway compares it with the
+	// authenticated caller, because an API key is a tenant-wide credential and
+	// nothing else on this path would stop it opening a neighbour's shell.
+	TenantID string
+	// Token is what execd was told to honour for this sandbox. Callers never
+	// see it: it is swapped in for the caller's own credential on the hop into
+	// the Pod, so the tenant's API key never reaches the sandbox.
+	Token     string
 	ExpiresAt time.Time
 	Phase     string
 }
@@ -84,6 +93,8 @@ func (c *CachedResolver) Resolve(ctx context.Context, id string) (Target, bool) 
 		Namespace: s.Namespace,
 		PodName:   s.Status.PodName,
 		PodIP:     s.Status.PodIP,
+		TenantID:  s.Labels[sbxv1.LabelTenant],
+		Token:     s.Status.Token,
 		Phase:     string(s.Status.Phase),
 	}
 	if s.Status.ExpiresAt != nil {
@@ -110,7 +121,11 @@ type Server struct {
 	Suffix string
 	// Transport is how a sandbox Pod is reached. When nil, its IP is dialled.
 	Transport Transport
-	Log       *slog.Logger
+	// Auth resolves the caller's API key. The data plane takes the same
+	// credential as the control plane, so there is no second token for a caller
+	// to carry, lose, or paste into a bug report.
+	Auth Authenticator
+	Log  *slog.Logger
 
 	proxy *httputil.ReverseProxy
 	once  sync.Once
@@ -209,6 +224,19 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 			"this URL does not correspond to a running sandbox")
 	}
 
+	// Establishing who the caller is comes before anything that could describe
+	// the cluster back to them. Host routing has to ask whether a sandbox
+	// exists in order to parse a hostname at all, so even the routing step
+	// leaks: 404 for an unknown id and 410 for an expired one, handed to
+	// someone who has shown no credential, is an oracle for which sandbox ids
+	// exist. The credential is the tenant's API key, the same one the control
+	// plane takes.
+	caller, err := s.authenticate(r)
+	if err != nil {
+		s.denied(w, err)
+		return
+	}
+
 	rt, err := s.router().Route(r)
 	if err != nil {
 		notFound()
@@ -220,17 +248,14 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 		notFound()
 		return
 	}
-	if !target.ExpiresAt.IsZero() && time.Now().After(target.ExpiresAt) {
-		writeErr(w, http.StatusGone, "expired", "this sandbox has expired")
+	// An API key is tenant-wide, so without this any key would open any sandbox
+	// in the cluster.
+	if target.TenantID == "" || caller.TenantID != target.TenantID {
+		s.denied(w, errForbidden)
 		return
 	}
-
-	// The token is checked here and again by execd. Two checks, because a
-	// misconfigured NetworkPolicy that let something reach a Pod directly must
-	// not be the only thing standing between a stranger and a shell.
-	if bearer(r) == "" {
-		writeJSON(w, http.StatusUnauthorized,
-			api.Error{Code: "unauthorized", Message: "a sandbox token is required"})
+	if !target.ExpiresAt.IsZero() && time.Now().After(target.ExpiresAt) {
+		writeErr(w, http.StatusGone, "expired", "this sandbox has expired")
 		return
 	}
 
@@ -259,6 +284,63 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx := context.WithValue(r.Context(), routeKey{}, &proxyRoute{target: target, route: rt, host: r.Host})
 	s.proxy.ServeHTTP(w, r.WithContext(ctx))
+}
+
+// Authenticator resolves a presented API key to the tenant it belongs to.
+//
+// The gateway is given one rather than a store: validating a key needs the
+// argon2id hashes in Postgres, and the less this package knows about that the
+// better.
+type Authenticator interface {
+	Verify(ctx context.Context, presented, clientIP string) (Caller, error)
+	// Deny renders a Verify failure, so both planes answer a bad key alike.
+	Deny(w http.ResponseWriter, err error)
+}
+
+// Caller is the authenticated tenant.
+type Caller struct {
+	TenantID string
+	// MayUse reports whether the key carries the scope the data plane needs.
+	MayUse bool
+}
+
+// errForbidden is returned for a key that is valid but not entitled here.
+var errForbidden = errors.New("this API key may not use this sandbox")
+
+func (s *Server) authenticate(r *http.Request) (Caller, error) {
+	if s.Auth == nil {
+		return Caller{}, errors.New("the gateway has no authenticator configured")
+	}
+	caller, err := s.Auth.Verify(r.Context(), bearer(r), clientIP(r))
+	if err != nil {
+		return Caller{}, err
+	}
+	if !caller.MayUse {
+		return Caller{}, errForbidden
+	}
+	return caller, nil
+}
+
+func (s *Server) denied(w http.ResponseWriter, err error) {
+	if errors.Is(err, errForbidden) {
+		writeErr(w, http.StatusForbidden, "forbidden", errForbidden.Error())
+		return
+	}
+	if s.Auth != nil {
+		s.Auth.Deny(w, err)
+		return
+	}
+	writeJSON(w, http.StatusUnauthorized, api.Error{Code: "unauthorized", Message: "an API key is required"})
+}
+
+func clientIP(r *http.Request) string {
+	// Only the last hop is trustworthy: a caller can set X-Forwarded-For to
+	// anything, and an IP allowlist that can be spoofed is worse than none.
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }
 
 // portsPath is the one data-plane route the gateway answers itself.

@@ -155,10 +155,18 @@ go run ./hack/dev/proxyprobe <namespace> <pod>
 
 它用 controller 同一套客户端跑一次 probe 和一次 bind，把三种 401 分开：Pod 连不上、Pod 没有凭据、凭据没送到。
 
-**6. gateway 走 proxy 时 token 换了个头。**
-`--sandbox-transport=apiserver-proxy` 下，沙箱 token 走 `X-Jdix-Control-Token` 而不是 `Authorization`——API server 会剥掉后者。如果你手搓 curl 去复现一个 401，注意这个差别：直连时两个头都行，走 proxy 时只有前者能到。用户端口（`/p/{port}/`）则两个都不给，租户自己的应用和我们没有这个约定。
+**6. 数据面 401 时，注意你和 execd 看到的不是同一个凭据。**
+你出示的是租户的 API key（`jdix_sk_…`，和控制面同一个）。gateway 验完之后会把它**换成沙箱自己的 token** 再进 Pod——所以抓包看 execd 收到的东西，永远不是你发出去的那个。两段各自会 401，原因完全不同：
 
-**7. 纯 docker 模式拿不到 userns 档位。**
+- gateway 401/403：key 不对、key 没有 `sandbox:read`、或者这个沙箱不属于你的租户。
+- execd 401：gateway 换进去的 `status.token` 和 execd 手里的对不上（通常是 controller 是旧的，或者 Pod 被重新绑过）。
+
+走 `--sandbox-transport=apiserver-proxy` 时还多一层：换进去的 token 走 `X-Jdix-Control-Token` 而不是 `Authorization`，因为 API server 会剥掉后者。用户端口（`/p/{port}/`）什么凭据都不给——那头是租户自己的应用。
+
+**7. 本地拆开跑 apiserver 和 gateway，key 对不上。**
+两个进程各有一份内存 store，`--dev-seed` 各印各的 key。用 `hack/dev/run.sh server`（一个进程两个 role），或者给两边同一个 `--database-url`。
+
+**8. 纯 docker 模式拿不到 userns 档位。**
 普通容器没办法授予非特权 user namespace，`local-docker.sh` 会测出 `chroot`，此时 `spec.filesystem.mounts` 会被拒绝。要调隔离本身就得用 `sandbox.sh`，或者加 `PRIVILEGED=1`（`--privileged` 顺带解开了 /proc 遮蔽和 seccomp，也就是 k8s 里那三项的等价物）。
 
 ---
