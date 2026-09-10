@@ -6,6 +6,13 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import List, Optional
 
+# NO_EXPIRY asks for a sandbox that never expires, for Client.create(ttl=...).
+#
+# The template has to permit it by setting no maxTTLSeconds; against a template
+# that caps lifetimes this yields the cap. Nothing then reclaims the sandbox if
+# the caller goes away, so close it yourself.
+NO_EXPIRY = -1
+
 
 @dataclass
 class Result:

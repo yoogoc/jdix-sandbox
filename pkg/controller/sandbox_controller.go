@@ -364,13 +364,19 @@ func (r *SandboxReconciler) bind(ctx context.Context, sbx *sbxv1.Sandbox) (ctrl.
 	}
 
 	boundAt := metav1.NewTime(r.now())
-	expiresAt := metav1.NewTime(r.now().Add(ttl))
 	sbx.Status.Phase = sbxv1.PhaseRunning
 	sbx.Status.PodIP = pod.Status.PodIP
 	sbx.Status.NodeName = pod.Spec.NodeName
 	sbx.Status.IsolationTier = sbxv1.IsolationTier(resp.IsolationTier)
 	sbx.Status.BoundAt = &boundAt
-	sbx.Status.ExpiresAt = &expiresAt
+	// Left nil for a sandbox that does not expire. Everything that enforces a
+	// deadline — this controller, the gateway, execd — already reads an absent
+	// one as "no deadline", so this is the only place that has to know.
+	sbx.Status.ExpiresAt = nil
+	if ttl > 0 {
+		expiresAt := metav1.NewTime(r.now().Add(ttl))
+		sbx.Status.ExpiresAt = &expiresAt
+	}
 	// The same token execd was just given. Without this the tenant has no way
 	// to obtain it, and every data-plane call is a 401 that looks like a bug in
 	// the caller.
@@ -390,7 +396,11 @@ func (r *SandboxReconciler) bind(ctx context.Context, sbx *sbxv1.Sandbox) (ctrl.
 		patched.Labels[sbxv1.LabelIsolationTier] = string(tier)
 		_ = r.Update(ctx, patched)
 	}
-	return ctrl.Result{RequeueAfter: expiresAt.Time.Sub(r.now())}, nil
+	if ttl <= 0 {
+		// Nothing to come back for.
+		return ctrl.Result{}, nil
+	}
+	return ctrl.Result{RequeueAfter: ttl}, nil
 }
 
 // watchExpiry enforces the TTL from the controller's side.
@@ -472,15 +482,32 @@ func (r *SandboxReconciler) template(ctx context.Context, sbx *sbxv1.Sandbox) (*
 }
 
 // ttlFor clamps the requested lifetime to the template's ceiling.
+// ttlFor decides how long a sandbox lives.
+//
+// A zero duration means it does not expire: there is no separate flag for that,
+// an absent deadline is the whole of it. Ask for one with a negative
+// ttlSeconds, on the sandbox or as the template's default.
+//
+// A template that caps lifetimes caps this too. maxTTLSeconds is what decides
+// whether a template's sandboxes may outlive their caller at all, so a request
+// to live forever against a capped template is answered with the cap rather
+// than refused — the tenant asked for as long as possible, and that is it.
 func ttlFor(sbx *sbxv1.Sandbox, tpl *sbxv1.SandboxTemplate) time.Duration {
 	want := sbx.Spec.TTLSeconds
-	if want <= 0 {
+	if want == 0 {
 		want = tpl.Spec.DefaultTTLSeconds
 	}
-	if want <= 0 {
+	if want == 0 {
 		want = 1800
 	}
-	if max := tpl.Spec.MaxTTLSeconds; max > 0 && want > max {
+	max := tpl.Spec.MaxTTLSeconds
+	if want < 0 {
+		if max > 0 {
+			return time.Duration(max) * time.Second
+		}
+		return 0
+	}
+	if max > 0 && want > max {
 		want = max
 	}
 	return time.Duration(want) * time.Second

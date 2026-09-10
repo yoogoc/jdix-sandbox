@@ -24,7 +24,7 @@ from ._errors import (
     SandboxFailed,
     SandboxTimeout,
 )
-from ._models import Chunk, FileInfo, Mount, Process, Result, SandboxInfo, Template
+from ._models import NO_EXPIRY, Chunk, FileInfo, Mount, Process, Result, SandboxInfo, Template
 from ._sandbox import Client, Sandbox
 
 __version__ = "0.1.0"
@@ -32,6 +32,7 @@ __version__ = "0.1.0"
 __all__ = [
     "Client",
     "Sandbox",
+    "NO_EXPIRY",
     "Mount",
     "Result",
     "Chunk",

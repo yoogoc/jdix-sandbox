@@ -158,8 +158,12 @@ spec:
                 minLength: 1
                 type: string
               ttlSeconds:
+                description: |-
+                  TTLSeconds is how long the sandbox may live. Omitted takes the template's
+                  default; negative asks for a sandbox that never expires, which the
+                  template grants by not setting maxTTLSeconds.
                 format: int32
-                minimum: 1
+                minimum: -1
                 type: integer
             required:
             - templateRef
@@ -234,6 +238,9 @@ spec:
               endpoint:
                 type: string
               expiresAt:
+                description: |-
+                  ExpiresAt absent means the sandbox does not expire. There is no separate
+                  flag for that, and every enforcement point reads it the same way.
                 format: date-time
                 type: string
               isolationTier:

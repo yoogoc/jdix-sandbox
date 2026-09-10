@@ -6,6 +6,8 @@ metadata:
 spec:
   minIsolationTier: userns
   defaultTTLSeconds: 1800
+  # 0 lifts the cap, which is also what permits a sandbox to ask for no expiry
+  # at all (ttlSeconds: -1). Nothing reclaims those if their caller goes away.
   maxTTLSeconds: 14400
   image:
     ref: m.daocloud.io/docker.io/library/python:3.15-rc

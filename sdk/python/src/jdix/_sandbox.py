@@ -13,7 +13,7 @@ from urllib.parse import quote, urlencode
 from ._client import DEFAULT_BASE_URL, Transport, _parse_time
 from ._errors import JdixError, NotFound, SandboxExpired, SandboxFailed
 from ._files import Files
-from ._models import Chunk, Mount, Process, Result, SandboxInfo, Template
+from ._models import NO_EXPIRY, Chunk, Mount, Process, Result, SandboxInfo, Template
 
 if TYPE_CHECKING:  # pragma: no cover
     import httpx
@@ -69,6 +69,11 @@ class Client:
     ) -> "Sandbox":
         """Start a sandbox and return a handle to it.
 
+        ``ttl`` is how long the sandbox may live, in seconds. Zero takes the
+        template's default; ``NO_EXPIRY`` asks for one that never expires, which
+        the template has to permit by setting no ``maxTTLSeconds``. Nothing then
+        reclaims that sandbox if this process goes away, so close it yourself.
+
         Set ``idempotency_key`` whenever the call might be replayed — a job
         runner, a queue consumer, anything with at-least-once delivery. Without
         one, a retry starts a second sandbox and bills for both.
@@ -91,7 +96,9 @@ class Client:
             raise SandboxFailed(info.reason or "the sandbox could not be started",
                                 code="sandbox_failed")
         sbx = Sandbox(self._t, info)
-        if keep_alive:
+        # A sandbox that never expires has no deadline to renew, so asking for
+        # both is not an error, it is just nothing to do.
+        if keep_alive and ttl != NO_EXPIRY:
             sbx._start_keep_alive(ttl or 600)
         return sbx
 

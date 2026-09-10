@@ -557,3 +557,69 @@ func TestSandboxClearsTheTokenWhenItStopsBeingUsable(t *testing.T) {
 		})
 	}
 }
+
+// An absent deadline is the whole of "this sandbox does not expire". There is
+// no flag beside it, so every enforcement point has one thing to read.
+func TestTTLFor(t *testing.T) {
+	tpl := func(def, max int32) *sbxv1.SandboxTemplate {
+		return &sbxv1.SandboxTemplate{Spec: sbxv1.SandboxTemplateSpec{
+			DefaultTTLSeconds: def, MaxTTLSeconds: max,
+		}}
+	}
+	sbx := func(ttl int32) *sbxv1.Sandbox {
+		return &sbxv1.Sandbox{Spec: sbxv1.SandboxSpec{TTLSeconds: ttl}}
+	}
+	cases := []struct {
+		name string
+		sbx  *sbxv1.Sandbox
+		tpl  *sbxv1.SandboxTemplate
+		want time.Duration
+	}{
+		{"asked for", sbx(600), tpl(1800, 14400), 600 * time.Second},
+		{"template default", sbx(0), tpl(1800, 14400), 1800 * time.Second},
+		{"nothing anywhere", sbx(0), tpl(0, 0), 1800 * time.Second},
+		{"capped", sbx(99999), tpl(1800, 14400), 14400 * time.Second},
+		// Permanent, and the template permits it by capping nothing.
+		{"permanent", sbx(-1), tpl(1800, 0), 0},
+		{"permanent by default", sbx(0), tpl(-1, 0), 0},
+		// A template that caps lifetimes caps this too: the tenant asked for as
+		// long as possible, and the cap is as long as possible.
+		{"permanent against a cap", sbx(-1), tpl(1800, 14400), 14400 * time.Second},
+	}
+	for _, tc := range cases {
+		if got := ttlFor(tc.sbx, tc.tpl); got != tc.want {
+			t.Errorf("%s: ttlFor = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestPermanentSandboxGetsNoDeadline(t *testing.T) {
+	tpl := approvedTemplate("py312")
+	tpl.Spec.MaxTTLSeconds = 0 // the template permits outliving its caller
+	pod := warmPod("warm-1", "py312", tpl.Status.Hash, string(bwrap.TierUserns), true)
+	sbx := newSandbox("sbx-1", "py312")
+	sbx.Spec.TTLSeconds = -1
+	c := newFakeClient(t, tpl, pod, sbx)
+	b := &fakeBinder{}
+	r := newSandboxReconciler(t, c, b)
+
+	got := drive(t, r, c, "sbx-1", 6)
+	if got.Status.Phase != sbxv1.PhaseRunning {
+		t.Fatalf("phase %q reason %q", got.Status.Phase, got.Status.Reason)
+	}
+	if got.Status.ExpiresAt != nil {
+		t.Errorf("status.expiresAt is %v; a permanent sandbox has none", got.Status.ExpiresAt)
+	}
+	// execd arms no self-destruct timer for a zero TTL, so it has to be told 0
+	// rather than something that rounds to "already expired".
+	if len(b.calls) != 1 || b.calls[0].TTLSeconds != 0 {
+		t.Fatalf("execd was told ttlSeconds=%v, want 0", b.calls)
+	}
+
+	// And the expiry pass must not reap it however far the clock moves.
+	r.Now = func() time.Time { return time.Now().Add(100 * 24 * time.Hour) }
+	after := drive(t, r, c, "sbx-1", 3)
+	if after.Status.Phase != sbxv1.PhaseRunning {
+		t.Errorf("phase %q after a hundred days; it should still be running", after.Status.Phase)
+	}
+}

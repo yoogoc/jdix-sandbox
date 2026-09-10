@@ -25,7 +25,7 @@
 | Pod 模型 | 一次性：一个 Sandbox 独占一个 Pod，销毁即删 Pod |
 | 编排事实源 | `Sandbox` CRD |
 | 沙箱能力 | Shell 执行（同步/流式/PTY）、文件读写、端口暴露 |
-| 状态 | 临时 + TTL，无 PVC 持久化、无 pause/resume |
+| 状态 | 默认临时 + TTL；`status.expiresAt` 为空即常驻（见 §04.6）。无 PVC 持久化、无 pause/resume |
 | 内核前提 | 未知，三档降级 + 探测（§03） |
 | 镜像 | 平台模板 + 租户自定义镜像，需准入 |
 | 目标并发 | ≤ 1000 沙箱 |
@@ -454,6 +454,16 @@ current > desired  → 删多余 idle，优先最老
 # 卡死回收
 idle 且 age > notReadyTimeout 且 not Ready → delete   ← 无卷 300s / 有卷 600s，见 §05.4
 idle 且 age > idleTTLSeconds         → delete
+### 4.6 常驻沙箱：expiresAt 为空
+
+**没有额外的开关字段。`status.expiresAt` 为空，就是不过期**——三处执行点（controller 的 `watchExpiry`、gateway 的过期检查、execd 的自杀定时器）本来就把"没有 deadline"读作"不过期"，所以只有 `ttlFor` 需要知道这件事。
+
+怎么要一个：`spec.ttlSeconds: -1`，或者模板 `defaultTTLSeconds: -1` 让这个模板的沙箱默认常驻。SDK 里是 `jdix.NoExpiry` / `jdix.NO_EXPIRY`。
+
+**模板用 `maxTTLSeconds` 决定给不给**：设了上限的模板会把常驻请求压回上限（租户要的是"尽可能久"，上限就是尽可能久），`maxTTLSeconds: 0` 才是真的放行。注意 CRD 给这个字段的默认值是 14400，所以要放行必须显式写 `maxTTLSeconds: 0`。
+
+**代价，明确记下来**：常驻沙箱**没有任何东西会回收它**。TTL 存在的头号理由是"SDK 崩溃 / 调用方消失时 Pod 必须自己消失"（§13），常驻等于对这类沙箱关掉这条保险。删除责任完全落在调用方身上。将来若要补一道网，合适的形状是 idle 超时（execd 记录最后一次数据面活动，静默超过 N 分钟自我终止），SandboxPool 的 `idleTTLSeconds` 已经是同一个概念——但那需要一个新字段，目前没做。
+
 # TTL 与兜底 GC
 Sandbox 且 now > expiresAt           → phase=Expired，删 Pod
 bound Pod 无对应 Sandbox（孤儿）      → delete

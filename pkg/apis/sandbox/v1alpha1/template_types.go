@@ -101,9 +101,16 @@ type SandboxTemplateSpec struct {
 	// in later needs a node pool, not an architecture change.
 	RuntimeClassName string `json:"runtimeClassName,omitempty"`
 
+	// DefaultTTLSeconds applies when a sandbox names no lifetime of its own.
+	// Negative makes this template's sandboxes permanent by default.
 	// +kubebuilder:default=1800
+	// +kubebuilder:validation:Minimum=-1
 	DefaultTTLSeconds int32 `json:"defaultTTLSeconds,omitempty"`
+	// MaxTTLSeconds caps every sandbox from this template. Zero means no cap,
+	// and is therefore also what permits a permanent sandbox: a template that
+	// caps lifetimes caps the permanent ones to the cap as well.
 	// +kubebuilder:default=14400
+	// +kubebuilder:validation:Minimum=0
 	MaxTTLSeconds int32 `json:"maxTTLSeconds,omitempty"`
 
 	Image              ImageSpec          `json:"image"`

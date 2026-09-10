@@ -83,7 +83,10 @@ type SecretRef struct {
 type SandboxSpec struct {
 	// +kubebuilder:validation:MinLength=1
 	TemplateRef string `json:"templateRef"`
-	// +kubebuilder:validation:Minimum=1
+	// TTLSeconds is how long the sandbox may live. Omitted takes the template's
+	// default; negative asks for a sandbox that never expires, which the
+	// template grants by not setting maxTTLSeconds.
+	// +kubebuilder:validation:Minimum=-1
 	TTLSeconds int32          `json:"ttlSeconds,omitempty"`
 	Filesystem FilesystemSpec `json:"filesystem,omitempty"`
 	Env        []EnvVar       `json:"env,omitempty"`
@@ -118,7 +121,9 @@ type SandboxStatus struct {
 	// moment the sandbox stops being usable.
 	Token string `json:"token,omitempty"`
 
-	BoundAt   *metav1.Time `json:"boundAt,omitempty"`
+	BoundAt *metav1.Time `json:"boundAt,omitempty"`
+	// ExpiresAt absent means the sandbox does not expire. There is no separate
+	// flag for that, and every enforcement point reads it the same way.
 	ExpiresAt *metav1.Time `json:"expiresAt,omitempty"`
 
 	// Reason explains a Failed or Expired phase in words a tenant can act on.

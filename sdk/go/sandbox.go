@@ -12,9 +12,19 @@ import (
 	"time"
 )
 
+// NoExpiry asks for a sandbox that never expires, for CreateOpts.TTL.
+//
+// The template has to permit it by setting no maxTTLSeconds; against a template
+// that caps lifetimes this yields the cap. Nothing then reclaims the sandbox if
+// the caller goes away, so close it yourself — a deferred Close, or a Delete
+// from whatever outlives the process.
+const NoExpiry = time.Duration(-1)
+
 // CreateOpts describes the sandbox you want.
 type CreateOpts struct {
 	Template string
+	// TTL is how long the sandbox may live. Zero takes the template's default;
+	// NoExpiry asks for one that never expires.
 	TTL      time.Duration
 	Env      map[string]string
 	Mounts   []Mount
@@ -112,7 +122,10 @@ func (c *Client) Create(ctx context.Context, opts CreateOpts) (*Sandbox, error) 
 		Env:      opts.Env,
 		Metadata: opts.Metadata,
 	}
-	if opts.TTL > 0 {
+	switch {
+	case opts.TTL == NoExpiry:
+		req.TTLSeconds = -1
+	case opts.TTL > 0:
 		req.TTLSeconds = int(opts.TTL.Seconds())
 	}
 	if len(opts.Mounts) > 0 {
@@ -141,7 +154,9 @@ func (c *Client) Create(ctx context.Context, opts CreateOpts) (*Sandbox, error) 
 	}
 
 	sbx := c.newSandbox(&out)
-	if opts.KeepAlive {
+	// A sandbox that never expires has no deadline to renew, so asking for both
+	// is not an error, it is just nothing to do.
+	if opts.KeepAlive && opts.TTL != NoExpiry {
 		sbx.startKeepAlive(opts.TTL)
 	}
 	return sbx, nil

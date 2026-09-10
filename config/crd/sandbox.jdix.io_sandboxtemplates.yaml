@@ -59,7 +59,11 @@ spec:
             properties:
               defaultTTLSeconds:
                 default: 1800
+                description: |-
+                  DefaultTTLSeconds applies when a sandbox names no lifetime of its own.
+                  Negative makes this template's sandboxes permanent by default.
                 format: int32
+                minimum: -1
                 type: integer
               filesystemDefaults:
                 description: FilesystemDefaults are applied to sandboxes that do not
@@ -142,7 +146,12 @@ spec:
                 type: object
               maxTTLSeconds:
                 default: 14400
+                description: |-
+                  MaxTTLSeconds caps every sandbox from this template. Zero means no cap,
+                  and is therefore also what permits a permanent sandbox: a template that
+                  caps lifetimes caps the permanent ones to the cap as well.
                 format: int32
+                minimum: 0
                 type: integer
               minIsolationTier:
                 default: userns

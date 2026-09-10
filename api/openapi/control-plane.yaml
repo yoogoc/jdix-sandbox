@@ -385,7 +385,13 @@ components:
           type: string
           format: uri
           description: Where the data-plane API lives. Empty until the sandbox is running.
-        expiresAt: { type: string, format: date-time }
+        expiresAt:
+          type: [string, "null"]
+          format: date-time
+          description: |
+            When the sandbox will be destroyed. Absent means it does not expire.
+            There is no separate flag for that: an absent deadline is the whole
+            of it, and every part of the platform reads it the same way.
         coldStart:
           type: boolean
           description: |
@@ -412,10 +418,17 @@ components:
         template: { type: string }
         ttlSeconds:
           type: integer
-          minimum: 1
+          minimum: -1
           description: |
-            Clamped to the template's ceiling. The sandbox is destroyed when it
-            elapses, whether or not anyone is still using it.
+            How long the sandbox may live, in seconds. Clamped to the template's
+            ceiling. The sandbox is destroyed when it elapses, whether or not
+            anyone is still using it.
+
+            Omit it to take the template's default. Send `-1` to ask for a
+            sandbox that never expires; the template permits that by setting no
+            `maxTTLSeconds`, and against one that does cap lifetimes you get the
+            cap instead. Nothing reclaims a sandbox that never expires if its
+            caller goes away, so delete it yourself.
         filesystem: { $ref: '#/components/schemas/FilesystemSpec' }
         env:
           type: object
