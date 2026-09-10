@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -20,8 +19,14 @@ import (
 )
 
 // Target is where a sandbox currently lives.
+//
+// Both a Pod IP and a Pod name are carried because the two transports need
+// different ones: dialling wants the address, the API server's pod proxy wants
+// the object.
 type Target struct {
 	SandboxID string
+	Namespace string
+	PodName   string
 	PodIP     string
 	ExpiresAt time.Time
 	Phase     string
@@ -74,7 +79,13 @@ func (c *CachedResolver) Resolve(ctx context.Context, id string) (Target, bool) 
 		return Target{}, false
 	}
 	s := list.Items[0]
-	t := Target{SandboxID: id, PodIP: s.Status.PodIP, Phase: string(s.Status.Phase)}
+	t := Target{
+		SandboxID: id,
+		Namespace: s.Namespace,
+		PodName:   s.Status.PodName,
+		PodIP:     s.Status.PodIP,
+		Phase:     string(s.Status.Phase),
+	}
 	if s.Status.ExpiresAt != nil {
 		t.ExpiresAt = s.Status.ExpiresAt.Time
 	}
@@ -97,10 +108,19 @@ type Server struct {
 	// Suffix is shorthand for a HostRouter, kept because host routing was the
 	// only scheme for most of this package's life.
 	Suffix string
-	Log    *slog.Logger
+	// Transport is how a sandbox Pod is reached. When nil, its IP is dialled.
+	Transport Transport
+	Log       *slog.Logger
 
 	proxy *httputil.ReverseProxy
 	once  sync.Once
+}
+
+func (s *Server) transport() Transport {
+	if s.Transport != nil {
+		return s.Transport
+	}
+	return DirectTransport{}
 }
 
 func (s *Server) router() Router {
@@ -113,9 +133,9 @@ func (s *Server) router() Router {
 // proxyRoute is what the Rewrite and ModifyResponse hooks need, carried on the
 // request context because httputil gives them nothing else to read.
 type proxyRoute struct {
-	upstream *url.URL
-	route    Route
-	host     string // the Host the client asked for
+	target Target
+	route  Route
+	host   string // the Host the client asked for
 }
 
 type routeKey struct{}
@@ -127,17 +147,16 @@ func routeOf(ctx context.Context) *proxyRoute {
 
 func (s *Server) init() {
 	s.proxy = &httputil.ReverseProxy{
+		Transport: s.transport().RoundTripper(),
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pt := routeOf(pr.In.Context())
-			pr.SetURL(pt.upstream)
-			pr.Out.Host = pr.In.Host
-
-			// SetURL keeps the inbound path, but under path routing its front
-			// is ours and means nothing to the sandbox. Both forms are set:
-			// EscapedPath prefers RawPath, and rewriting only the decoded path
-			// would turn an escaped separator into a real one on the way in.
-			pr.Out.URL.Path = pt.route.Rest
-			pr.Out.URL.RawPath = pt.route.RawRest
+			// The transport owns the URL, the Host and the token, because those
+			// three answers change together. It also strips the routing prefix:
+			// under path routing the front of the path is ours and means
+			// nothing to the sandbox. Both the decoded and raw forms are set,
+			// since EscapedPath prefers RawPath and rewriting only the decoded
+			// one would turn an escaped separator into a real one on the way in.
+			s.transport().Rewrite(pr, pt.target, pt.route)
 
 			// The gateway is the last hop that knows the real client, and the
 			// sandbox is untrusted, so forwarding headers are set rather than
@@ -233,8 +252,12 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	u := &url.URL{Scheme: "http", Host: net.JoinHostPort(target.PodIP, strconv.Itoa(rt.Port))}
-	ctx := context.WithValue(r.Context(), routeKey{}, &proxyRoute{upstream: u, route: rt, host: r.Host})
+	if err := s.transport().Reachable(target); err != nil {
+		s.Log.Warn("sandbox not reachable", "sandbox", rt.SandboxID, "err", err)
+		writeErr(w, http.StatusBadGateway, "sandbox_unreachable", err.Error())
+		return
+	}
+	ctx := context.WithValue(r.Context(), routeKey{}, &proxyRoute{target: target, route: rt, host: r.Host})
 	s.proxy.ServeHTTP(w, r.WithContext(ctx))
 }
 

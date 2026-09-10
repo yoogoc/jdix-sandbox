@@ -36,6 +36,11 @@ rules:
   - apiGroups: ["sandbox.jdix.io"]
     resources: ["sandboxpools"]
     verbs: ["get", "list", "watch", "create", "update"]
+  # Nothing here for pods/proxy: in-cluster the gateway dials Pod IPs directly.
+  # --sandbox-transport=apiserver-proxy is for running outside the cluster on a
+  # human's kubeconfig; granting it to this ServiceAccount would route the whole
+  # data plane through the API server, which is the one thing that mode warns
+  # against.
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

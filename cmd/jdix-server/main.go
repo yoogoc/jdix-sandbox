@@ -34,6 +34,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
@@ -83,7 +84,9 @@ func main() {
 		pathPrefix = flag.String("path-prefix", gateway.DefaultPathPrefix, "routing prefix, for path routing; must stay disjoint from the control plane's /v1/")
 		publicBase = flag.String("public-base", "",
 			"public origin URLs are rendered against, e.g. https://api.example.com; empty derives it from each request, which is right unless something upstream rewrites Host")
-		cacheTTL = flag.Duration("resolve-cache-ttl", 2*time.Second, "how long a sandbox lookup is reused")
+		cacheTTL         = flag.Duration("resolve-cache-ttl", 2*time.Second, "how long a sandbox lookup is reused")
+		sandboxTransport = flag.String("sandbox-transport", "direct",
+			"how to reach a sandbox Pod: 'direct' dials its IP; 'apiserver-proxy' goes through the Kubernetes API server's pod proxy (for running this outside the cluster)")
 	)
 	flag.Parse()
 
@@ -104,6 +107,11 @@ func main() {
 		log.Error("bad configuration", "err", err)
 		os.Exit(1)
 	}
+	transportKind, err := parseTransport(*sandboxTransport)
+	if err != nil {
+		log.Error("bad configuration", "err", err)
+		os.Exit(1)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
@@ -112,7 +120,8 @@ func main() {
 	// needs an index; the control plane always knows the namespace and does
 	// not. Building it only when it is used keeps the cache honest about what
 	// this process is for.
-	kube, reader, err := startCluster(ctx, log, r.data)
+	cfg := ctrl.GetConfigOrDie()
+	kube, reader, err := startCluster(ctx, cfg, log, r.data)
 	if err != nil {
 		log.Error("connecting to Kubernetes", "err", err)
 		os.Exit(1)
@@ -156,14 +165,22 @@ func main() {
 		cached.TTL = *cacheTTL
 		resolver.Resolver = cached
 
+		transport, err := newTransport(transportKind, cfg, log)
+		if err != nil {
+			log.Error("building the sandbox transport", "err", err)
+			os.Exit(1)
+		}
+
 		listeners = append(listeners, &listener{
 			name: "data-plane",
 			// A PTY session ends when someone stops typing into it, so draining
 			// is worth more here than promptness.
 			grace: 60 * time.Second,
 			server: &http.Server{
-				Addr:              *dataAddr,
-				Handler:           (&gateway.Server{Resolver: cached, Router: router, Log: log}).Handler(),
+				Addr: *dataAddr,
+				Handler: (&gateway.Server{
+					Resolver: cached, Router: router, Transport: transport, Log: log,
+				}).Handler(),
 				ReadHeaderTimeout: 15 * time.Second,
 				// No write timeout: PTY sessions and exec streams are long-lived
 				// by design, and cutting them off after a fixed period would look
@@ -172,12 +189,47 @@ func main() {
 		})
 	}
 
-	log.Info("starting", "role", *roleFlag, "routeMode", *routeMode)
+	log.Info("starting", "role", *roleFlag, "routeMode", *routeMode, "sandboxTransport", *sandboxTransport)
 	if err := serve(ctx, log, listeners); err != nil {
 		log.Error("server stopped", "err", err)
 		os.Exit(1)
 	}
 	log.Info("stopped")
+}
+
+// transportKind names a way of reaching a sandbox Pod. It is parsed before
+// anything opens a socket and turned into a Transport afterwards, because
+// building one needs a REST config and rejecting a typo should not.
+type transportKind string
+
+const (
+	transportDirect   transportKind = "direct"
+	transportAPIProxy transportKind = "apiserver-proxy"
+)
+
+func parseTransport(s string) (transportKind, error) {
+	switch transportKind(s) {
+	case transportDirect, transportAPIProxy:
+		return transportKind(s), nil
+	default:
+		return "", fmt.Errorf("unknown --sandbox-transport %q: want direct or apiserver-proxy", s)
+	}
+}
+
+func newTransport(kind transportKind, cfg *rest.Config, log *slog.Logger) (gateway.Transport, error) {
+	if kind == transportDirect {
+		return gateway.DirectTransport{}, nil
+	}
+	t, err := gateway.NewAPIProxyTransport(cfg)
+	if err != nil {
+		return nil, err
+	}
+	// Louder than the controller's equivalent warning, and deliberately so.
+	// There, one bind is one proxied request; here every byte of every exec,
+	// PTY session and file transfer becomes API server traffic.
+	log.Warn("reaching sandboxes through the API server's pod proxy",
+		"note", "all data-plane traffic becomes API server load; this is for debugging from outside the cluster, not for production")
+	return t, nil
 }
 
 // lateResolver stands in for the informer-backed resolver while the routing
@@ -316,7 +368,7 @@ func seed(mem *apiserver.MemStore, log *slog.Logger) {
 // create, and the gateway resolves hostnames against it. Polling an informer
 // costs nothing, where polling the API server directly would put tens of
 // requests per create onto the control plane.
-func startCluster(ctx context.Context, log *slog.Logger, withNameIndex bool) (client.Client, client.Reader, error) {
+func startCluster(ctx context.Context, cfg *rest.Config, log *slog.Logger, withNameIndex bool) (client.Client, client.Reader, error) {
 	scheme := runtime.NewScheme()
 	if err := clientgoscheme.AddToScheme(scheme); err != nil {
 		return nil, nil, err
@@ -324,7 +376,7 @@ func startCluster(ctx context.Context, log *slog.Logger, withNameIndex bool) (cl
 	if err := sbxv1.AddToScheme(scheme); err != nil {
 		return nil, nil, err
 	}
-	cl, err := cluster.New(ctrl.GetConfigOrDie(), func(o *cluster.Options) { o.Scheme = scheme })
+	cl, err := cluster.New(cfg, func(o *cluster.Options) { o.Scheme = scheme })
 	if err != nil {
 		return nil, nil, err
 	}

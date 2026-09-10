@@ -21,7 +21,7 @@ make dev-preflight        # 或 hack/dev/preflight.sh
 | 隔离档位本身（bwrap 在真实内核上的行为） | `hack/dev/sandbox.sh` | 不需要（走 port-forward） |
 | `pkg/controller`（绑定、预热池、准入） | `hack/dev/run.sh controller` | **需要** |
 | `pkg/apiserver`（API Key、配额、幂等） | `hack/dev/run.sh apiserver` | 不需要 |
-| `pkg/gateway`（子域名路由） | `hack/dev/run.sh gateway` | **需要** |
+| `pkg/gateway`（路由、反代） | `hack/dev/run.sh gateway` | 不需要（默认走 API server 代理） |
 | 两个 SDK | 指向本地 apiserver，见下 | 不需要 |
 
 ### Pod 网络不通怎么办
@@ -45,7 +45,16 @@ API server 本来就能连到每个 Pod，而你已经有 kubeconfig 了。所�
 
 **这不是生产用的 transport。**每次 bind、unbind、probe 都变成一次 API server 的代理请求——把系统里最忙的路径压到最不该成为瓶颈的组件上。生产用 `direct`，它是默认值。需要 RBAC `pods/proxy`（已在 `config/rbac/role.yaml` 里）。
 
-gateway 没有这个逃生口：它按定义就是到 Pod IP 的反向代理，调它确实需要 Pod 网络可达。
+gateway 有同样的逃生口，flag 叫 `--sandbox-transport=direct|apiserver-proxy`，`hack/dev/run.sh` 里默认也是 `apiserver-proxy`。`kubectl port-forward` 同样救不了场：gateway 代理到的是请求进来时那个沙箱绑定的 Pod，事先不知道是哪个。
+
+**gateway 走这条路要多做两件事**，都在 `pkg/gateway/transport.go` 里：
+
+1. **token 必须从 `Authorization` 挪走。** API server 会剥掉这个头（这是对的：调用方的集群凭据不该落到 workload 里），而且 client-go 的 transport 看到已有的 `Authorization` 就不会覆盖——沙箱 token 会被当成 gateway 自己的凭据送给 API server。两条路都通向 401。所以走这条 transport 时 token 改用 `X-Jdix-Control-Token`，execd 本来就认这个头。
+2. **寻址方式变了。** 直连用 `podIP:port`，pod proxy 用 `namespace/podName`。没绑定到具名 Pod 的沙箱会得到一个说明清楚的 502，而不是更下游某处的怪错误。
+
+WebSocket 能穿过去，这一点实测过：client-go 的 transport 和 API server 协商的是 HTTP/2，而 HTTP/2 明令禁止 `Connection` 与 `Upgrade` 头——但 net/http 遇到带 `Upgrade` 的请求会退回 HTTP/1.1，所以同一个 transport 上普通请求走 h2、升级请求走 HTTP/1.1 并拿到真正的 101。不需要手动钉协议。
+
+**这条路比 controller 那条更不能用于生产**：controller 是每次 bind 一个代理请求，gateway 是 exec、PTY、文件传输的**每一个字节**都变成 API server 流量。
 
 ### 另一条路：envtest，完全不要集群
 
@@ -146,8 +155,8 @@ go run ./hack/dev/proxyprobe <namespace> <pod>
 
 它用 controller 同一套客户端跑一次 probe 和一次 bind，把三种 401 分开：Pod 连不上、Pod 没有凭据、凭据没送到。
 
-**6. gateway 没有 proxy 逃生口。**
-controller 可以走 API server 代理，gateway 不行——它的职责就是把公网流量反代到 Pod IP。调 gateway 需要 Pod 网络可达，或者把它放进集群跑。
+**6. gateway 走 proxy 时 token 换了个头。**
+`--sandbox-transport=apiserver-proxy` 下，沙箱 token 走 `X-Jdix-Control-Token` 而不是 `Authorization`——API server 会剥掉后者。如果你手搓 curl 去复现一个 401，注意这个差别：直连时两个头都行，走 proxy 时只有前者能到。用户端口（`/p/{port}/`）则两个都不给，租户自己的应用和我们没有这个约定。
 
 **7. 纯 docker 模式拿不到 userns 档位。**
 普通容器没办法授予非特权 user namespace，`local-docker.sh` 会测出 `chroot`，此时 `spec.filesystem.mounts` 会被拒绝。要调隔离本身就得用 `sandbox.sh`，或者加 `PRIVILEGED=1`（`--privileged` 顺带解开了 /proc 遮蔽和 seccomp，也就是 k8s 里那三项的等价物）。

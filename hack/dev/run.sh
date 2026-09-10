@@ -9,16 +9,16 @@
 #   hack/dev/run.sh apiserver            # just the control plane
 #   hack/dev/run.sh gateway              # just the data plane
 #   DLV=1 hack/dev/run.sh controller     # wait for a debugger on :2345
-#   TRANSPORT=direct hack/dev/run.sh controller   # dial Pod IPs instead of proxying
+#   TRANSPORT=direct hack/dev/run.sh ...  # dial Pod IPs instead of proxying
 #
 # `server` is one process and one terminal, which is what you want most of the
 # time. The split forms exist so you can restart one half without dropping the
 # other's connections while you are working on it.
 #
-# The controller defaults to --execd-transport=apiserver-proxy here, so binding
-# works from a laptop with no route to the Pod network. The gateway half has no
-# such escape hatch: it is a reverse proxy to Pod IPs by definition, so
-# debugging it does need Pod-network access.
+# Both the controller and the gateway default to reaching Pods through the API
+# server's pod proxy here, so they work from a laptop with no route to the Pod
+# network. Set TRANSPORT=direct if hack/dev/preflight.sh said the Pod network is
+# routable; it is faster, and it is what production uses.
 set -euo pipefail
 
 COMPONENT=${1:-}
@@ -80,6 +80,7 @@ case "$COMPONENT" in
     [ "$ROLE" = gateway ] || echo "  (in-memory store; the dev API key is printed below)" >&2
     launch ./cmd/jdix-server \
       --role="$ROLE" \
+      --sandbox-transport="${TRANSPORT:-apiserver-proxy}" \
       --addr=:8000 \
       --data-addr=:8090 \
       --route-mode=path \

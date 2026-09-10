@@ -699,6 +699,21 @@ gateway 支持两种方式，由 `--route-mode` 选择，controller 的 `--endpo
 
 **不重写响应体**。HTML/CSS/JS 里的绝对路径由应用自己负责，`X-Forwarded-Prefix` 告诉它挂在哪。改写响应体的代理必然漏掉内联脚本拼接的 URL、`url()`、`srcset` 中的某一类，而做对四类会让所有人以为第五类也对。
 
+### gateway 到 Pod 的 transport
+
+`--sandbox-transport=direct|apiserver-proxy`，与 controller 的 `--execd-transport` 对应。
+
+`direct` 直连 `podIP:port`，生产用这个。`apiserver-proxy` 走 API server 的 pod proxy 子资源（`/api/v1/namespaces/{ns}/pods/http:{pod}:{port}/proxy/...`），让 gateway 能在集群外调试——沙箱 Pod 没有 Service，笔记本通常路由不到 Pod 网段，而 `port-forward` 救不了场：代理目标是请求进来时那个沙箱绑定的 Pod，事先不知道是哪个。
+
+走 proxy 时有两处必须变，否则表现为一个指不到病根的 401：
+
+1. **token 从 `Authorization` 挪到 `X-Jdix-Control-Token`。** API server 会剥掉 `Authorization`（对的：调用方的集群凭据不该落进 workload），而且 client-go 的 transport 不覆盖已存在的 `Authorization`——沙箱 token 会被当作 gateway 自己的凭据送给 API server。用户端口不给 token：租户自己的应用和我们没有这个约定。
+2. **寻址从 `podIP` 换成 `namespace/podName`。** 所以 `Target` 两个都带。
+
+WebSocket 能穿过去（实测）：client-go 与 API server 协商 HTTP/2，而 HTTP/2 禁止 `Connection`/`Upgrade` 头；但 net/http 对带 `Upgrade` 的请求退回 HTTP/1.1，同一个 transport 上普通请求走 h2、升级走 HTTP/1.1 拿到真 101。不需要钉协议。
+
+**比 controller 的同名开关更不能用于生产**：那边是每次 bind 一个代理请求，这边是 exec、PTY、文件传输的每一个字节都变成 API server 流量。
+
 ### 用户端口暴露
 
 `POST /v1/ports {port: 8000}` 由 **gateway 直接应答**，不转发给 execd——答案是一个 URL，而 URL 的形状恰恰是 execd 唯一不知道的东西：没有任何环节告诉过它自己被发布在什么域名、什么方案下。两个 SDK 原先在客户端自行拼 URL，在第二种方案出现的那一刻就错了。
