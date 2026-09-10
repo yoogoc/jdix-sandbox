@@ -28,9 +28,9 @@ The full design, including the decisions that were rejected and why, is in
 ## Layout
 
 ```
-cmd/jdix-apiserver  tenant-facing REST API: keys, quota, admission
+cmd/jdix-server     tenant REST API and sandbox data plane, one binary:
+                    --role=server | gateway | all (DESIGN.md §1, §8)
 cmd/jdix-controller reconciles Sandbox, SandboxTemplate, SandboxPool
-cmd/jdix-gateway    publishes sandboxes, by path or by subdomain (DESIGN.md §8)
 cmd/jdix-execd      container PID 1, outside the namespace: measures the node,
                     binds a sandbox, proxies the data plane
 cmd/jdix-init       PID 1 inside the namespace: reaps orphans, runs commands,

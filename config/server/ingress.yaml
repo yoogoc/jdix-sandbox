@@ -2,13 +2,16 @@
 #
 # /v1/ is the tenant API, /s/ is every sandbox. One certificate, one DNS record,
 # and the certificate is issuable over HTTP-01 — no DNS-01 solver, no wildcard.
-
+#
+# Both paths reach the same Service here because --role=all serves both from one
+# Pod. Splitting the roles into two Deployments changes only the service names
+# below; the URLs tenants hold do not move.
 #
 # What this buys in simplicity it gives up in isolation: every sandbox shares
 # one origin, so the browser's same-origin policy no longer separates one
 # tenant's exposed web app from another's. That is fine for SDK traffic, where
 # no browser is involved. Before publishing untrusted web content on user ports,
-# read config/gateway/ingress-host.yaml, which does not have that property.
+# read config/server/ingress-host.yaml, which does not have that property.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -40,7 +43,7 @@ spec:
             pathType: Prefix
             backend:
               service:
-                name: jdix-apiserver
+                name: jdix-server
                 port: { number: 8000 }
           # Must stay disjoint from /v1/ above; the gateway's --path-prefix
           # says which prefix it claims.
@@ -48,5 +51,5 @@ spec:
             pathType: Prefix
             backend:
               service:
-                name: jdix-gateway
+                name: jdix-server
                 port: { number: 8090 }

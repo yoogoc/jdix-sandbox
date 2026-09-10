@@ -1,7 +1,7 @@
 # jdix-sandbox data plane — the sandbox's own API.
 #
-# Reached at the `endpoint` a created sandbox returns, through jdix-gateway,
-# which resolves the sandbox and proxies to its Pod. Served by jdix-execd, which
+# Reached at the `endpoint` a created sandbox returns, through jdix-server's
+# gateway role, which resolves the sandbox and proxies to its Pod. Served by jdix-execd, which
 # authenticates and forwards to jdix-init inside the namespace.
 #
 # Never build these URLs from parts. The gateway publishes a sandbox either on
@@ -290,7 +290,7 @@ paths:
       tags: [lifecycle]
       summary: Report where a port inside the sandbox is published
       description: |
-        Answered by jdix-gateway, not forwarded into the sandbox: the answer is
+        Answered by the gateway, not forwarded into the sandbox: the answer is
         a URL, and nothing ever tells execd what hostname or routing scheme it
         is published under.
 

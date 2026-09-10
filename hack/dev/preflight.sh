@@ -3,7 +3,8 @@
 # about anything that is missing.
 #
 # The interesting question is the last one. Sandbox Pods deliberately have no
-# Service, so jdix-controller and jdix-gateway reach them by Pod IP. Whether a
+# Service, so jdix-controller and jdix-server's gateway role reach them by Pod
+# IP. Whether a
 # process on this host can route to the cluster's Pod CIDR decides how you
 # debug: run those components here, or run them in the cluster and debug the
 # rest from here.
@@ -72,10 +73,10 @@ else
   if timeout 4 bash -c "cat < /dev/null > /dev/tcp/$POD_IP/1" 2>/dev/null \
      || timeout 4 bash -c "cat < /dev/null > /dev/tcp/$POD_IP/10250" 2>/dev/null; then
     ok "Pod network is routable from this host"
-    echo "     → run jdix-controller and jdix-gateway here (hack/dev/run.sh)"
+    echo "     → run jdix-controller and jdix-server here (hack/dev/run.sh)"
   elif timeout 4 ping -c1 -W2 "$POD_IP" >/dev/null 2>&1; then
     ok "Pod IP answers ICMP; TCP probably works too"
-    echo "     → run jdix-controller and jdix-gateway here (hack/dev/run.sh)"
+    echo "     → run jdix-controller and jdix-server here (hack/dev/run.sh)"
   else
     warn "Pod network NOT routable from this host"
     echo "     → jdix-controller cannot bind sandboxes from here: binding is an"

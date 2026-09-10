@@ -5,15 +5,20 @@
 # normal debugger, normal logs, and a rebuild loop measured in seconds.
 #
 #   hack/dev/run.sh controller
-#   hack/dev/run.sh apiserver
-#   hack/dev/run.sh gateway
+#   hack/dev/run.sh server               # jdix-server --role=all: both ports
+#   hack/dev/run.sh apiserver            # just the control plane
+#   hack/dev/run.sh gateway              # just the data plane
 #   DLV=1 hack/dev/run.sh controller     # wait for a debugger on :2345
 #   TRANSPORT=direct hack/dev/run.sh controller   # dial Pod IPs instead of proxying
 #
+# `server` is one process and one terminal, which is what you want most of the
+# time. The split forms exist so you can restart one half without dropping the
+# other's connections while you are working on it.
+#
 # The controller defaults to --execd-transport=apiserver-proxy here, so binding
-# works from a laptop with no route to the Pod network. The gateway has no such
-# escape hatch: it is a reverse proxy to Pod IPs by definition, so debugging it
-# does need Pod-network access.
+# works from a laptop with no route to the Pod network. The gateway half has no
+# such escape hatch: it is a reverse proxy to Pod IPs by definition, so
+# debugging it does need Pod-network access.
 set -euo pipefail
 
 COMPONENT=${1:-}
@@ -22,7 +27,7 @@ IMAGE=${IMAGE:-jdix/sandbox-base:dev}
 DLV=${DLV:-0}
 DLV_PORT=${DLV_PORT:-2345}
 
-usage() { sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
+usage() { sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 1; }
 [ -n "$COMPONENT" ] || usage
 
 # The controller needs the sandbox image by digest, the same way the template
@@ -61,24 +66,25 @@ case "$COMPONENT" in
       --zap-devel=true
     ;;
 
-  apiserver)
+  server|apiserver|gateway)
     # No --database-url: the in-memory store plus --dev-seed prints a usable API
     # key on start-up, so there is nothing to provision before the first call.
-    echo "  apiserver → http://127.0.0.1:8000 (in-memory store, key printed below)" >&2
-    launch ./cmd/jdix-apiserver \
+    # Path routing needs no DNS locally either — the sandbox id is in the URL,
+    # so http://127.0.0.1:8090/s/<id>/v1/exec works straight from curl.
+    case "$COMPONENT" in
+      server)    ROLE=all;     BANNER="control plane :8000 + data plane :8090" ;;
+      apiserver) ROLE=server;  BANNER="control plane → http://127.0.0.1:8000" ;;
+      gateway)   ROLE=gateway; BANNER="data plane → http://127.0.0.1:8090, sandboxes at /s/<id>/" ;;
+    esac
+    echo "  jdix-server --role=$ROLE → $BANNER" >&2
+    [ "$ROLE" = gateway ] || echo "  (in-memory store; the dev API key is printed below)" >&2
+    launch ./cmd/jdix-server \
+      --role="$ROLE" \
       --addr=:8000 \
+      --data-addr=:8090 \
+      --route-mode=path \
       --dev-seed \
       --ready-timeout=15s \
-      --log-level=debug
-    ;;
-
-  gateway)
-    # Path routing needs no DNS at all locally: the sandbox id is in the URL,
-    # so http://127.0.0.1:8090/s/<id>/v1/exec works straight from curl.
-    echo "  gateway → http://127.0.0.1:8090, sandboxes at /s/<id>/" >&2
-    launch ./cmd/jdix-gateway \
-      --addr=:8090 \
-      --route-mode=path \
       --log-level=debug
     ;;
 

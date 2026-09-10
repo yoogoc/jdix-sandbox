@@ -110,7 +110,7 @@ dlv connect :2345                      # 或者 IDE 里连 remote
 绕法：用 `hack/dev/sandbox.sh`，它走 port-forward，压根不碰 endpoint。要让 SDK 端到端跑通，最小改动是给 controller 加一个 `--endpoint-scheme` flag（一行），本地设成 `http`。
 
 **2. apiserver `--dev-seed` 的租户命名空间是 `tenant-dev`。**
-它写死在 `cmd/jdix-apiserver/main.go` 的 `seed()` 里，而 `hack/dev/up.sh` 默认建的是 `jdix-dev`。通过 apiserver 创建沙箱时两边要对齐：
+它写死在 `cmd/jdix-server/main.go` 的 `seed()` 里，而 `hack/dev/up.sh` 默认建的是 `jdix-dev`。通过 apiserver 创建沙箱时两边要对齐：
 
 ```sh
 NS=tenant-dev hack/dev/up.sh

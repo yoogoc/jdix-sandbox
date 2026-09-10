@@ -69,8 +69,8 @@
        └───────────────┬───────────────────┘
                        ▼
         ┌──────────────────────────────┐
-        │     jdix-apiserver (Go)      │   无状态，多副本
-        │  认证 · 配额 · 镜像准入        │   HTTP/JSON + WS
+        │  jdix-server --role=server   │   无状态，多副本
+        │  认证 · 配额 · 镜像准入        │   :8000 HTTP/JSON
         │  管理平台后端 · 审计 · 计量     │
         └───┬──────────────────┬───────┘
             │ Postgres         │ 创建 Sandbox CR / watch status
@@ -101,19 +101,37 @@
                                  ▲
                                  │ 直连 Pod IP（无 Service）
                      ┌───────────┴──────────────┐
-                     │    jdix-gateway (Go)     │
+                     │ jdix-server --role=gateway│  :8090
                      └──────────────────────────┘
+
+   两个 role 是同一个二进制。--role=all 时一个进程起两个 http.Server，
+   各自一个端口、各自一套超时；见 §1.1。
 ```
 
 | 组件 | 语言 | 职责 |
 |---|---|---|
-| `jdix-apiserver` | Go | REST API、API Key 认证、配额、镜像准入、管理平台后端（embed Console） |
+| `jdix-server` | Go | 一个二进制两个角色，`--role` 选择：`server` = REST API、API Key 认证、配额、镜像准入、管理平台后端；`gateway` = 数据面反代 + 用户端口路由（见 §8）；`all` = 两个都起 |
 | `jdix-controller` | Go / controller-runtime | Sandbox 绑定、SandboxPool 供给、模板滚动、TTL 与兜底 GC |
 | `jdix-execd` | Go | Pod 内守护进程，容器 PID 1；生成并 exec bwrap、暴露数据面 |
 | `jdix-init` | Go（同二进制不同 argv） | bwrap namespace 内 PID 1；施加 spec 挂载、fork 用户进程、回收僵尸 |
-| `jdix-gateway` | Go | 数据面反代 + 用户端口路由（path 或子域名，见 §8） |
-| `jdix-console` | React / Vite | 管理平台前端，embed 进 apiserver 二进制 |
+| `jdix-console` | React / Vite | 管理平台前端，embed 进 jdix-server 二进制 |
 | `jdixctl` | Go | CLI |
+
+### 1.1 为什么控制面和数据面同一个二进制、却是两个 listener
+
+**同一个二进制**：两者共用 informer cache、Kubernetes 连接、日志与配置装配。在 ≤1000 并发的目标下，多一个 Deployment 换不来任何东西。
+
+**两个 listener**，即使 `--role=all` 也不合并到一个端口，原因是它们的超时画像正相反：
+
+| | 控制面 :8000 | 数据面 :8090 |
+|---|---|---|
+| `WriteTimeout` | 60s（冷启动要等，但不能挂死） | **不设**（PTY 会话按小时算） |
+| 优雅退出 | 15s | 60s，尽量把流放完 |
+| 流量 | 短事务 JSON | 长连接、流式 |
+
+一个 `http.Server` 只有一个 `WriteTimeout`。合并端口就必须二选一：要么控制面失去挂死保护，要么 PTY 被定时切断——后者在用户眼里和沙箱崩溃完全一样。分开还带来副作用红利：两个端口可以挂不同的 Service、Ingress 和 NetworkPolicy，将来要限连接数也是各限各的。
+
+**`--role` 的意义是把"合并"降级成部署决策而不是架构决策。** 合并的真实代价是故障域耦合：`--role=all` 下，为了改一条配额规则重启进程，会掐掉当时所有活着的 PTY。真到那一天，同一个镜像起两个 Deployment、各带一个 role，Ingress 只改 backend 名字，租户手里的 URL 一个都不用动。`--role=gateway` 的 Pod 不需要 `DATABASE_URL`，它根本不打开 store。
 
 ---
 

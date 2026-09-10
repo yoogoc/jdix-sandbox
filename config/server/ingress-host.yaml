@@ -55,5 +55,5 @@ spec:
             pathType: Prefix
             backend:
               service:
-                name: jdix-gateway
+                name: jdix-server
                 port: { number: 8090 }
