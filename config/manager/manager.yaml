@@ -77,7 +77,11 @@ spec:
           image: registry.internal/jdix/controller:dev
           args:
             - --platform-image=registry.internal/jdix/sandbox-base:dev
-            - --endpoint-suffix=sbx.example.com
+            # Must match the gateway's --route-mode and --path-prefix. The
+            # controller writes the URL; the gateway has to accept it back.
+            - --endpoint-mode=path
+            - --endpoint-base=https://api.example.com
+            - --endpoint-path-prefix=/s
             - --allowed-registries=registry.internal
             - --leader-elect
           ports:

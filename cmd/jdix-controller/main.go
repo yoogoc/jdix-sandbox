@@ -7,6 +7,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"os"
 	"strings"
 	"time"
@@ -21,6 +22,7 @@ import (
 	sbxv1 "jdix.io/sandbox/pkg/apis/sandbox/v1alpha1"
 	"jdix.io/sandbox/pkg/bwrap"
 	"jdix.io/sandbox/pkg/controller"
+	"jdix.io/sandbox/pkg/gateway"
 )
 
 var scheme = runtime.NewScheme()
@@ -32,11 +34,15 @@ func init() {
 
 func main() {
 	var (
-		metricsAddr    = flag.String("metrics-bind-address", ":8080", "metrics listen address")
-		probeAddr      = flag.String("health-probe-bind-address", ":8081", "health probe listen address")
-		leaderElect    = flag.Bool("leader-elect", true, "elect a leader before reconciling")
-		platformImage  = flag.String("platform-image", "", "image carrying execd, jdix-init and bubblewrap")
-		endpointSuffix = flag.String("endpoint-suffix", "sbx.example.com", "wildcard domain sandboxes are published under")
+		metricsAddr   = flag.String("metrics-bind-address", ":8080", "metrics listen address")
+		probeAddr     = flag.String("health-probe-bind-address", ":8081", "health probe listen address")
+		leaderElect   = flag.Bool("leader-elect", true, "elect a leader before reconciling")
+		platformImage = flag.String("platform-image", "", "image carrying execd, jdix-init and bubblewrap")
+		endpointMode  = flag.String("endpoint-mode", "path",
+			"how sandbox URLs are formed: 'path' publishes {base}/s/{id}; 'host' publishes {id}.{suffix}. Must match the gateway's --route-mode")
+		endpointSuffix = flag.String("endpoint-suffix", "sbx.example.com", "wildcard domain, for --endpoint-mode=host")
+		endpointBase   = flag.String("endpoint-base", "", "public origin, for --endpoint-mode=path, e.g. https://api.example.com")
+		endpointPrefix = flag.String("endpoint-path-prefix", gateway.DefaultPathPrefix, "routing prefix, for --endpoint-mode=path; must match the gateway's --path-prefix")
 		registries     = flag.String("allowed-registries", "", "comma-separated registry allowlist for tenant images")
 		resolveImages  = flag.Bool("resolve-images", true,
 			"resolve a template's image tag to a digest by asking the registry; disable for an air-gapped install, where references must already be pinned")
@@ -53,6 +59,11 @@ func main() {
 
 	if *platformImage == "" {
 		log.Error(nil, "--platform-image is required: without it a sandbox Pod has no execd to run")
+		os.Exit(1)
+	}
+	endpoints, err := newEndpointRouter(*endpointMode, *endpointSuffix, *endpointBase, *endpointPrefix)
+	if err != nil {
+		log.Error(err, "configuring sandbox URLs")
 		os.Exit(1)
 	}
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
@@ -148,7 +159,7 @@ func main() {
 		Platform:    platform,
 		Binder:      binder,
 		Prober:      prober,
-		EndpointFor: func(id string) string { return "https://" + id + "." + *endpointSuffix },
+		EndpointFor: endpoints.EndpointURL,
 	}).SetupWithManager(mgr); err != nil {
 		log.Error(err, "wiring the sandbox reconciler")
 		os.Exit(1)
@@ -157,11 +168,32 @@ func main() {
 	must(mgr.AddHealthzCheck("healthz", healthz.Ping))
 	must(mgr.AddReadyzCheck("readyz", healthz.Ping))
 
-	log.Info("starting", "platformImage", *platformImage,
-		"endpointSuffix", *endpointSuffix, "execdTransport", *transport)
+	log.Info("starting", "platformImage", *platformImage, "endpointMode", *endpointMode,
+		"sampleEndpoint", endpoints.EndpointURL("sbx-example"), "execdTransport", *transport)
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		log.Error(err, "manager stopped")
 		os.Exit(1)
+	}
+}
+
+// newEndpointRouter renders the URLs the gateway has to accept.
+//
+// Both ends build the same type from their own flags rather than each
+// formatting a string, because a controller that published one shape while the
+// gateway parsed another would produce sandboxes that look healthy in every
+// status field and 404 for the tenant.
+func newEndpointRouter(mode, suffix, base, prefix string) (gateway.Router, error) {
+	switch mode {
+	case "path":
+		if base == "" {
+			return nil, fmt.Errorf("--endpoint-base is required with --endpoint-mode=path: " +
+				"a sandbox URL has to be absolute, and nothing here can guess the public origin")
+		}
+		return gateway.PathRouter{Prefix: prefix, Base: strings.TrimSuffix(base, "/")}, nil
+	case "host":
+		return gateway.HostRouter{Suffix: suffix, Scheme: "https"}, nil
+	default:
+		return nil, fmt.Errorf("unknown --endpoint-mode %q: want path or host", mode)
 	}
 }
 

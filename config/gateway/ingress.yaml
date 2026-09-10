@@ -1,0 +1,52 @@
+# Path routing: control plane and sandbox traffic on one hostname.
+#
+# /v1/ is the tenant API, /s/ is every sandbox. One certificate, one DNS record,
+# and the certificate is issuable over HTTP-01 — no DNS-01 solver, no wildcard.
+
+#
+# What this buys in simplicity it gives up in isolation: every sandbox shares
+# one origin, so the browser's same-origin policy no longer separates one
+# tenant's exposed web app from another's. That is fine for SDK traffic, where
+# no browser is involved. Before publishing untrusted web content on user ports,
+# read config/gateway/ingress-host.yaml, which does not have that property.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: jdix
+  namespace: jdix-system
+  annotations:
+    # PTY and exec streams are long-lived by design. nginx-ingress defaults to
+    # a 60s read timeout, which would cut them off and look to the user exactly
+    # like the sandbox crashing — the very thing the gateway avoids by setting
+    # no WriteTimeout of its own.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    # Without this the gateway's FlushInterval: -1 is undone one hop later and
+    # exec output arrives in blocks.
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    # File uploads. The default cap is 1m.
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"
+    cert-manager.io/cluster-issuer: letsencrypt
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: [api.example.com]
+      secretName: jdix-api-tls
+  rules:
+    - host: api.example.com
+      http:
+        paths:
+          - path: /v1/
+            pathType: Prefix
+            backend:
+              service:
+                name: jdix-apiserver
+                port: { number: 8000 }
+          # Must stay disjoint from /v1/ above; the gateway's --path-prefix
+          # says which prefix it claims.
+          - path: /s/
+            pathType: Prefix
+            backend:
+              service:
+                name: jdix-gateway
+                port: { number: 8090 }

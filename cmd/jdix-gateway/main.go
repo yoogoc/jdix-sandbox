@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -29,9 +30,14 @@ import (
 
 func main() {
 	var (
-		addr     = flag.String("addr", ":8080", "listen address")
-		suffix   = flag.String("suffix", "sbx.example.com", "wildcard domain sandboxes are published under")
-		cacheTTL = flag.Duration("resolve-cache-ttl", 2*time.Second, "how long a hostname resolution is reused")
+		addr      = flag.String("addr", ":8080", "listen address")
+		routeMode = flag.String("route-mode", "path",
+			"how a request names its sandbox: 'path' serves /s/{id}/... under one hostname; 'host' serves {id}.{suffix}; 'both' accepts either and hands out path URLs")
+		suffix     = flag.String("suffix", "sbx.example.com", "wildcard domain, for host routing")
+		pathPrefix = flag.String("path-prefix", gateway.DefaultPathPrefix, "routing prefix, for path routing; must stay disjoint from the control plane's /v1/")
+		publicBase = flag.String("public-base", "",
+			"public origin URLs are rendered against, e.g. https://api.example.com; empty derives it from each request, which is right unless something upstream rewrites Host")
+		cacheTTL = flag.Duration("resolve-cache-ttl", 2*time.Second, "how long a sandbox lookup is reused")
 		logLevel = flag.String("log-level", "info", "debug|info|warn|error")
 	)
 	flag.Parse()
@@ -49,7 +55,13 @@ func main() {
 	resolver := gateway.NewCachedResolver(reader)
 	resolver.TTL = *cacheTTL
 
-	srv := &gateway.Server{Resolver: resolver, Suffix: *suffix, Log: log}
+	router, err := newRouter(*routeMode, *suffix, *pathPrefix, *publicBase, resolver)
+	if err != nil {
+		log.Error("configuring routing", "err", err)
+		os.Exit(1)
+	}
+
+	srv := &gateway.Server{Resolver: resolver, Router: router, Log: log}
 	httpSrv := &http.Server{
 		Addr:              *addr,
 		Handler:           srv.Handler(),
@@ -61,7 +73,7 @@ func main() {
 
 	errCh := make(chan error, 1)
 	go func() {
-		log.Info("listening", "addr", *addr, "suffix", *suffix)
+		log.Info("listening", "addr", *addr, "routeMode", *routeMode, "suffix", *suffix, "pathPrefix", *pathPrefix)
 		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}
@@ -77,6 +89,28 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	_ = httpSrv.Shutdown(shutdownCtx)
+}
+
+// newRouter builds the routing scheme from flags.
+//
+// The same construction runs in jdix-controller, which renders the URLs this
+// gateway has to accept. The two must agree, which is why the rendering lives
+// on the Router rather than in a fmt.Sprintf at each end.
+func newRouter(mode, suffix, prefix, base string, res gateway.Resolver) (gateway.Router, error) {
+	host := gateway.HostRouter{Suffix: suffix, Resolver: res}
+	path := gateway.PathRouter{Prefix: prefix, Base: base}
+	switch mode {
+	case "path":
+		return path, nil
+	case "host":
+		return host, nil
+	case "both":
+		// Path first, so a gateway accepting both hands out the new scheme.
+		// That is what migrating to it consists of.
+		return gateway.ChainRouter{path, host}, nil
+	default:
+		return nil, fmt.Errorf("unknown --route-mode %q: want path, host or both", mode)
+	}
 }
 
 // startCache brings up an informer over Sandbox objects and indexes them by

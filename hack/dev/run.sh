@@ -53,7 +53,8 @@ case "$COMPONENT" in
     launch ./cmd/jdix-controller \
       --platform-image="$(platform_image)" \
       --execd-transport="${TRANSPORT:-apiserver-proxy}" \
-      --endpoint-suffix="sbx.localhost" \
+      --endpoint-mode=path \
+      --endpoint-base="${ENDPOINT_BASE:-http://127.0.0.1:8090}" \
       --leader-elect=false \
       --metrics-bind-address=:18080 \
       --health-probe-bind-address=:18081 \
@@ -72,10 +73,12 @@ case "$COMPONENT" in
     ;;
 
   gateway)
-    echo "  gateway → http://127.0.0.1:8090, hosts *.sbx.localhost" >&2
+    # Path routing needs no DNS at all locally: the sandbox id is in the URL,
+    # so http://127.0.0.1:8090/s/<id>/v1/exec works straight from curl.
+    echo "  gateway → http://127.0.0.1:8090, sandboxes at /s/<id>/" >&2
     launch ./cmd/jdix-gateway \
       --addr=:8090 \
-      --suffix="sbx.localhost" \
+      --route-mode=path \
       --log-level=debug
     ;;
 

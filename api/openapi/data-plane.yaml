@@ -1,8 +1,13 @@
 # jdix-sandbox data plane — the sandbox's own API.
 #
 # Reached at the `endpoint` a created sandbox returns, through jdix-gateway,
-# which routes by hostname and proxies to the Pod. Served by jdix-execd, which
+# which resolves the sandbox and proxies to its Pod. Served by jdix-execd, which
 # authenticates and forwards to jdix-init inside the namespace.
+#
+# Never build these URLs from parts. The gateway publishes a sandbox either on
+# its own subdomain or under a path on a shared hostname, and which one is an
+# operator's decision; `endpoint` is the only thing that knows. Prefix it with
+# the paths below and nothing else.
 #
 # The control plane — creating and destroying sandboxes — is a separate surface;
 # see control-plane.yaml.
@@ -13,8 +18,8 @@ info:
   version: 0.1.0
   summary: Run commands and move files inside one sandbox.
   description: |
-    Every request here concerns exactly one sandbox: the hostname identifies it
-    and the bearer token authorises it. There is no path parameter for the
+    Every request here concerns exactly one sandbox: the `endpoint` identifies
+    it and the bearer token authorises it. There is no path parameter for the
     sandbox, because there is nothing else this endpoint could be about.
 
     Streaming endpoints upgrade to WebSocket. OpenAPI has no way to describe a
@@ -23,12 +28,14 @@ info:
     and use a WebSocket client; both SDKs do.
 
 servers:
-  - url: https://{sandbox}.sbx.example.com
-    description: One sandbox, through jdix-gateway
+  - url: '{endpoint}'
+    description: |
+      The `endpoint` from the created sandbox, verbatim. Under path routing it
+      looks like https://api.example.com/s/sbx-a3f9k2mq; under host routing,
+      like https://sbx-a3f9k2mq.sbx.example.com.
     variables:
-      sandbox:
-        default: sbx-a3f9k2mq
-        description: The sandbox id.
+      endpoint:
+        default: https://api.example.com/s/sbx-a3f9k2mq
 
 security:
   - sandboxToken: []

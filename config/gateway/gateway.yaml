@@ -1,0 +1,93 @@
+# jdix-gateway: the public entry point for sandbox traffic.
+#
+# It reverse-proxies straight to Pod IPs. Sandbox Pods deliberately have no
+# Service — one per tenant request would add a Service and an Endpoints object
+# per sandbox, and endpoint propagation alone can take longer than the whole
+# warm-pool bind it would be sitting behind. The gateway itself does need one.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: jdix-gateway
+  namespace: jdix-system
+---
+# Read-only, cluster-wide. The gateway resolves a sandbox id to a Pod IP and
+# does nothing else; it has no business writing anything.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: jdix-gateway
+rules:
+  - apiGroups: ["sandbox.jdix.io"]
+    resources: ["sandboxes"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: jdix-gateway
+subjects:
+  - kind: ServiceAccount
+    name: jdix-gateway
+    namespace: jdix-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: jdix-gateway
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jdix-gateway
+  namespace: jdix-system
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app.kubernetes.io/name: jdix-gateway }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: jdix-gateway }
+    spec:
+      serviceAccountName: jdix-gateway
+      # A PTY session lives as long as someone is typing into it, so a rolling
+      # update has to be given time to drain rather than cutting them off.
+      terminationGracePeriodSeconds: 120
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: gateway
+          image: registry.internal/jdix/gateway:dev
+          args:
+            # Path routing: every sandbox under one hostname, so one
+            # certificate and one DNS record. --public-base is omitted on
+            # purpose; the gateway reads the origin off each request, which is
+            # correct behind an Ingress that preserves Host.
+            - --route-mode=path
+            - --path-prefix=/s
+            - --addr=:8090
+          ports:
+            - { name: http, containerPort: 8090 }
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 10
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 3
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { cpu: "2", memory: 512Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jdix-gateway
+  namespace: jdix-system
+spec:
+  selector: { app.kubernetes.io/name: jdix-gateway }
+  ports:
+    - { name: http, port: 8090, targetPort: http }

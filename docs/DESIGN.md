@@ -111,7 +111,7 @@
 | `jdix-controller` | Go / controller-runtime | Sandbox 绑定、SandboxPool 供给、模板滚动、TTL 与兜底 GC |
 | `jdix-execd` | Go | Pod 内守护进程，容器 PID 1；生成并 exec bwrap、暴露数据面 |
 | `jdix-init` | Go（同二进制不同 argv） | bwrap namespace 内 PID 1；施加 spec 挂载、fork 用户进程、回收僵尸 |
-| `jdix-gateway` | Go | 数据面反代 + 用户端口 `https://{sbx}-{port}.sbx.example.com` 路由 |
+| `jdix-gateway` | Go | 数据面反代 + 用户端口路由（path 或子域名，见 §8） |
 | `jdix-console` | React / Vite | 管理平台前端，embed 进 apiserver 二进制 |
 | `jdixctl` | Go | CLI |
 
@@ -147,7 +147,7 @@ status:
   podName / podIP / nodeName
   isolationTier: userns
   coldStart: false
-  endpoint: https://sbx-01j8xk7m2q.sbx.example.com
+  endpoint: https://api.example.com/s/sbx-01j8xk7m2q   # 见 §8；SDK 只拼接，不解析
   boundAt / expiresAt
   conditions: [ { type: Ready, status: "True", … } ]
 ```
@@ -577,7 +577,7 @@ apiserver 创建/更新 `SandboxTemplate` 时同步执行，同时配 Validating
 | 链路 | 协议 | 鉴权 |
 |---|---|---|
 | SDK / Console → apiserver | HTTPS + JSON | `Authorization: Bearer jdix_sk_…` / OIDC session |
-| SDK → gateway → execd 数据面 | HTTPS + JSON，流式 WS | `Authorization: Bearer sbt_…`（gateway 与 execd 各校验一次） |
+| SDK → gateway → execd 数据面 | HTTPS + JSON，流式 WS | `Authorization: Bearer sbt_…`（gateway 与 execd 各校验一次）；URL 一律取 `status.endpoint` 前缀，SDK 不自行拼装 |
 | controller → execd 控制面 | HTTP + JSON（集群内 `:8081`） | mTLS 或集群内 bearer token |
 | execd → jdix-init | **HTTP over unix socket**（`/run/jdix/init.sock`） | 文件权限 0600 + 单向 |
 | apiserver → k8s | client-go（本来就是 HTTP） | ServiceAccount |
@@ -657,11 +657,35 @@ GET  /internal/v1/probe     # readinessProbe 用
 
 ## 8. 网络
 
+### 路由方式（v0.4 修订）
+
+gateway 支持两种方式，由 `--route-mode` 选择，controller 的 `--endpoint-mode` 必须与之一致。两端都用 `pkg/gateway` 里同一个 `Router` 类型渲染和解析 URL——若各写一段 `fmt.Sprintf`，controller 发出的 URL 和 gateway 接受的 URL 一旦分叉，每个状态字段都正常，只有租户拿到 404。
+
+| | path（默认） | host |
+|---|---|---|
+| 数据面 | `https://api.example.com/s/{id}/v1/exec` | `https://{id}.sbx.example.com/v1/exec` |
+| 用户端口 | `https://api.example.com/s/{id}/p/8000/` | `https://{id}-8000.sbx.example.com/` |
+| 证书 | 单域名，HTTP-01 | 泛域名，**只能 DNS-01** |
+| DNS | 一条 A 记录 | 通配记录 |
+| Ingress | 与控制面共用一个 host（`/v1/` vs `/s/`） | 独立 Ingress |
+| 端口歧义 | 无 | `{id}-8000` 需查询沙箱是否存在才能消解 |
+| **浏览器隔离** | **无**：所有沙箱同源 | 每个沙箱独立 origin |
+
+**path 的代价必须写在明处**：所有沙箱共享一个 origin，同源策略在沙箱之间不再提供任何隔离——一个沙箱暴露端口上的脚本可以读另一个沙箱的响应、cookie 和 localStorage。SDK 数据面不涉及浏览器，不受影响；**用户端口只有在内容可信时才适合 path**。需要跑不可信 web 内容时选 host，并且把用户端口放到与控制面不同的可注册域上（`*.sbx.example.com` 与 `api.example.com` 共享 eTLD+1，cookie 与 SameSite 都不区分二者）。
+
+**path 模式下 gateway 做三件修补**，都在 `pkg/gateway/server.go`：
+
+1. 无尾斜杠时 301 到 `{prefix}/`——否则沙箱返回的页面里每个相对 URL 都解析高一层。
+2. 重写上游 `Location`，把前缀加回去。仅限本站相对路径，指向别处的原样放行。
+3. 重写 `Set-Cookie` 的 `Path`，让沙箱之间不互相覆盖 session。这不是隔离边界，同源下脚本照样能读，注释里写清楚了。
+
+**不重写响应体**。HTML/CSS/JS 里的绝对路径由应用自己负责，`X-Forwarded-Prefix` 告诉它挂在哪。改写响应体的代理必然漏掉内联脚本拼接的 URL、`url()`、`srcset` 中的某一类，而做对四类会让所有人以为第五类也对。
+
 ### 用户端口暴露
 
-`https://{sandbox-id}-{port}.sbx.example.com` → gateway 按子域名解析 → 直连 `PodIP:port`，泛域名证书。
+`POST /v1/ports {port: 8000}` 由 **gateway 直接应答**，不转发给 execd——答案是一个 URL，而 URL 的形状恰恰是 execd 唯一不知道的东西：没有任何环节告诉过它自己被发布在什么域名、什么方案下。两个 SDK 原先在客户端自行拼 URL，在第二种方案出现的那一刻就错了。
 
-**不要用路径前缀**（`/sandboxes/{id}/ports/{p}/`）——会破坏沙箱内 web app 的绝对路径资源引用。端口需显式声明才可访问：`POST /v1/ports {port: 8000, public: true}`，返回带签名的 URL。
+这个调用**不授予任何权限**：持有沙箱 token 的调用方本来就能访问 Pod 上任何端口，它只是回答"在哪里"。真正的端口白名单需要 gateway 或 execd 持久化状态，两者都没有，所以不假装有。
 
 ### 出网控制
 
@@ -701,7 +725,7 @@ GET    /v1/admin/budget              全局预热预算与已分配量
   "state":         "running",
   "template":      "py312-small",
   "isolationTier": "userns",
-  "endpoint":      "https://sbx-01j8xk.sbx.example.com",
+  "endpoint":      "https://api.example.com/s/sbx-01j8xk",
   "token":         "sbt_...",
   "expiresAt":     "2026-09-08T10:30:00Z",
   "coldStart":     false

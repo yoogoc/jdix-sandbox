@@ -9,6 +9,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -90,19 +91,54 @@ func (c *CachedResolver) store(id string, t Target) {
 // Server is the public entry point for sandbox traffic.
 type Server struct {
 	Resolver Resolver
-	Suffix   string
-	Log      *slog.Logger
+	// Router decides how a request names its sandbox. When nil, requests are
+	// routed by hostname over Suffix.
+	Router Router
+	// Suffix is shorthand for a HostRouter, kept because host routing was the
+	// only scheme for most of this package's life.
+	Suffix string
+	Log    *slog.Logger
 
 	proxy *httputil.ReverseProxy
 	once  sync.Once
 }
 
+func (s *Server) router() Router {
+	if s.Router != nil {
+		return s.Router
+	}
+	return HostRouter{Suffix: s.Suffix, Resolver: s.Resolver}
+}
+
+// proxyRoute is what the Rewrite and ModifyResponse hooks need, carried on the
+// request context because httputil gives them nothing else to read.
+type proxyRoute struct {
+	upstream *url.URL
+	route    Route
+	host     string // the Host the client asked for
+}
+
+type routeKey struct{}
+
+func routeOf(ctx context.Context) *proxyRoute {
+	pr, _ := ctx.Value(routeKey{}).(*proxyRoute)
+	return pr
+}
+
 func (s *Server) init() {
 	s.proxy = &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
-			target := pr.In.Context().Value(targetKey{}).(*url.URL)
-			pr.SetURL(target)
+			pt := routeOf(pr.In.Context())
+			pr.SetURL(pt.upstream)
 			pr.Out.Host = pr.In.Host
+
+			// SetURL keeps the inbound path, but under path routing its front
+			// is ours and means nothing to the sandbox. Both forms are set:
+			// EscapedPath prefers RawPath, and rewriting only the decoded path
+			// would turn an escaped separator into a real one on the way in.
+			pr.Out.URL.Path = pt.route.Rest
+			pr.Out.URL.RawPath = pt.route.RawRest
+
 			// The gateway is the last hop that knows the real client, and the
 			// sandbox is untrusted, so forwarding headers are set rather than
 			// appended: a value the client supplied must not survive.
@@ -110,18 +146,33 @@ func (s *Server) init() {
 				pr.Out.Header.Set("X-Forwarded-For", ip)
 			}
 			pr.Out.Header.Set("X-Forwarded-Proto", "https")
+			if pt.route.Prefix != "" {
+				// The one thing a sub-path-aware application needs in order to
+				// generate its own URLs correctly. Everything else this proxy
+				// does for path routing is repair work after the fact.
+				pr.Out.Header.Set("X-Forwarded-Prefix", pt.route.Prefix)
+			} else {
+				pr.Out.Header.Del("X-Forwarded-Prefix")
+			}
 		},
 		// Stream rather than buffer: exec output and PTY sessions are useless
 		// if they arrive in blocks.
 		FlushInterval: -1,
+		ModifyResponse: func(resp *http.Response) error {
+			pt := routeOf(resp.Request.Context())
+			if pt == nil || pt.route.Prefix == "" {
+				return nil
+			}
+			rewriteLocation(resp.Header, pt.route.Prefix, pt.host)
+			rewriteCookiePaths(resp.Header, pt.route.Prefix)
+			return nil
+		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			s.Log.Warn("proxy error", "host", r.Host, "path", r.URL.Path, "err", err)
 			writeErr(w, http.StatusBadGateway, "sandbox_unreachable", "the sandbox is not responding")
 		},
 	}
 }
-
-type targetKey struct{}
 
 func (s *Server) Handler() http.Handler {
 	s.once.Do(s.init)
@@ -134,21 +185,20 @@ func (s *Server) Handler() http.Handler {
 }
 
 func (s *Server) route(w http.ResponseWriter, r *http.Request) {
-	exists := func(id string) bool {
-		_, ok := s.Resolver.Resolve(r.Context(), id)
-		return ok
-	}
-	rt, err := ParseHost(r.Host, s.Suffix, exists)
-	if err != nil {
+	notFound := func() {
 		writeErr(w, http.StatusNotFound, "unknown_sandbox",
-			"this hostname does not correspond to a running sandbox")
+			"this URL does not correspond to a running sandbox")
+	}
+
+	rt, err := s.router().Route(r)
+	if err != nil {
+		notFound()
 		return
 	}
 
 	target, ok := s.Resolver.Resolve(r.Context(), rt.SandboxID)
 	if !ok {
-		writeErr(w, http.StatusNotFound, "unknown_sandbox",
-			"this hostname does not correspond to a running sandbox")
+		notFound()
 		return
 	}
 	if !target.ExpiresAt.IsZero() && time.Now().After(target.ExpiresAt) {
@@ -165,9 +215,173 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A URL that named the sandbox with no trailing slash is redirected rather
+	// than forwarded. Serving the sandbox's index page here would leave the
+	// browser resolving every relative URL in it one segment too high, and the
+	// page would come back a broken skeleton with no clue why.
+	if rt.Prefix != "" && rt.Rest == "" {
+		to := rt.Prefix + "/"
+		if r.URL.RawQuery != "" {
+			to += "?" + r.URL.RawQuery
+		}
+		http.Redirect(w, r, to, http.StatusMovedPermanently)
+		return
+	}
+
+	if !rt.UserPort && r.Method == http.MethodPost && rt.Rest == portsPath {
+		s.exposePort(w, r, rt)
+		return
+	}
+
 	u := &url.URL{Scheme: "http", Host: net.JoinHostPort(target.PodIP, strconv.Itoa(rt.Port))}
-	ctx := context.WithValue(r.Context(), targetKey{}, u)
+	ctx := context.WithValue(r.Context(), routeKey{}, &proxyRoute{upstream: u, route: rt, host: r.Host})
 	s.proxy.ServeHTTP(w, r.WithContext(ctx))
+}
+
+// portsPath is the one data-plane route the gateway answers itself.
+const portsPath = "/v1/ports"
+
+type exposeRequest struct {
+	Port   int  `json:"port"`
+	Public bool `json:"public"`
+}
+
+type exposeResponse struct {
+	Port int    `json:"port"`
+	URL  string `json:"url"`
+}
+
+// exposePort answers the SDKs' Expose call.
+//
+// It is handled here rather than forwarded to execd because the answer is a
+// URL, and a URL's shape is precisely what execd does not know: nothing ever
+// tells it the hostname or the routing scheme it is published under. Both SDKs
+// used to derive the URL locally from the endpoint they were given, which was
+// wrong the moment a second scheme existed.
+//
+// There is no allowlist behind this call. Every port on the Pod is already
+// reachable to a caller holding the sandbox's token, and an allowlist would
+// need durable state that neither the gateway nor execd keeps. What this does
+// is tell the caller where to look — no more, and the SDK docs say so.
+func (s *Server) exposePort(w http.ResponseWriter, r *http.Request, rt Route) {
+	var req exposeRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid_body", err.Error())
+		return
+	}
+	if req.Port <= 0 || req.Port > 65535 {
+		writeErr(w, http.StatusBadRequest, "invalid_port", "port must be between 1 and 65535")
+		return
+	}
+	if req.Port == DataPlanePort {
+		writeErr(w, http.StatusBadRequest, "reserved_port",
+			"port 8080 is the sandbox's own data plane and is reached at the endpoint itself")
+		return
+	}
+	writeJSON(w, http.StatusOK, exposeResponse{
+		Port: req.Port,
+		URL:  s.absolute(r, s.router().PortURL(rt.SandboxID, req.Port)),
+	})
+}
+
+// absolute resolves a reference a Router rendered without knowing the origin.
+func (s *Server) absolute(r *http.Request, ref string) string {
+	switch {
+	case strings.Contains(ref, "://"):
+		return ref
+	case strings.HasPrefix(ref, "//"):
+		return scheme(r) + ":" + ref
+	default:
+		return scheme(r) + "://" + r.Host + ref
+	}
+}
+
+// scheme reports what the client actually used. Behind an Ingress the header is
+// always set; without one, reporting https for a plaintext local listener would
+// hand out URLs that do not work.
+func scheme(r *http.Request) string {
+	if p := r.Header.Get("X-Forwarded-Proto"); p != "" {
+		return p
+	}
+	if r.TLS != nil {
+		return "https"
+	}
+	return "http"
+}
+
+// rewriteLocation puts the routing prefix back on a redirect the sandbox issued.
+//
+// An application behind path routing has no idea it is behind anything, so it
+// answers "Location: /login" and the browser leaves the sandbox altogether.
+// This covers redirects only; see the package comment for why response bodies
+// are left alone.
+func rewriteLocation(h http.Header, prefix, host string) {
+	loc := h.Get("Location")
+	if loc == "" {
+		return
+	}
+	u, err := url.Parse(loc)
+	if err != nil {
+		return
+	}
+	if u.Host != "" && !strings.EqualFold(u.Host, host) {
+		// It points somewhere else entirely, which is the application's
+		// business. Rewriting would break more than it fixed.
+		return
+	}
+	if !strings.HasPrefix(u.Path, "/") {
+		// Relative to the current directory, so it already resolves against a
+		// URL that carries the prefix.
+		return
+	}
+	u.Path = prefix + u.Path
+	u.RawPath = "" // let String re-encode from Path
+	h.Set("Location", u.String())
+}
+
+// rewriteCookiePaths scopes a sandbox's cookies to its own prefix.
+//
+// Under path routing every sandbox shares one origin, so a cookie set with
+// Path=/ is sent to every other sandbox as well and they overwrite each other's
+// sessions. This stops that. It is explicitly not an isolation boundary —
+// script in one sandbox can still read another's cookies, because it is the
+// same origin and the same jar — and nothing here should be mistaken for one.
+func rewriteCookiePaths(h http.Header, prefix string) {
+	cookies := h.Values("Set-Cookie")
+	if len(cookies) == 0 {
+		return
+	}
+	scoped := make([]string, 0, len(cookies))
+	for _, c := range cookies {
+		scoped = append(scoped, scopeCookie(c, prefix))
+	}
+	h.Del("Set-Cookie")
+	for _, c := range scoped {
+		h.Add("Set-Cookie", c)
+	}
+}
+
+// scopeCookie edits the Path attribute and leaves every other byte alone.
+// Cookies carry attributes this code has never heard of — Partitioned, Priority
+// — and re-serialising a parsed cookie silently drops them.
+func scopeCookie(cookie, prefix string) string {
+	parts := strings.Split(cookie, ";")
+	for i := 1; i < len(parts); i++ { // parts[0] is name=value
+		name, value, _ := strings.Cut(parts[i], "=")
+		if !strings.EqualFold(strings.TrimSpace(name), "path") {
+			continue
+		}
+		p := strings.TrimSpace(value)
+		if !strings.HasPrefix(p, "/") {
+			p = "/" + p
+		}
+		parts[i] = " Path=" + prefix + p
+		return strings.Join(parts, ";")
+	}
+	// No Path attribute means the browser derives one from the request path,
+	// which under path routing is the sandbox's prefix plus whatever directory
+	// it was serving. Pinning it is both narrower and predictable.
+	return cookie + "; Path=" + prefix + "/"
 }
 
 func bearer(r *http.Request) string {

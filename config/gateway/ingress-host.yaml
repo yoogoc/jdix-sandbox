@@ -1,0 +1,59 @@
+# Host routing: one subdomain per sandbox. The alternative to ingress.yaml.
+#
+# Every sandbox is its own origin, so the same-origin policy separates one
+# tenant's exposed web app from the next. That is the reason to choose this:
+# it is the only version safe to serve untrusted browser content from.
+#
+# It costs a wildcard certificate, which ACME will only issue over DNS-01 —
+# HTTP-01 cannot do wildcards — plus a wildcard DNS record pointing at the load
+# balancer. Set the gateway's --route-mode=host and the controller's
+# --endpoint-mode=host to match, or sandboxes will be handed URLs this Ingress
+# does not serve.
+#
+# One property worth knowing before choosing the domain: *.sbx.example.com and
+# api.example.com share a registrable domain, so a page served from a sandbox
+# can set a cookie for .example.com that reaches the control plane and every
+# other sandbox, and SameSite does not separate them. Publishing user ports on a
+# genuinely separate domain is the only thing that does.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: jdix-sbx-wildcard
+  namespace: jdix-system
+spec:
+  secretName: jdix-sbx-wildcard-tls
+  issuerRef:
+    name: letsencrypt-dns01
+    kind: ClusterIssuer
+  dnsNames:
+    - "*.sbx.example.com"
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: jdix-sandbox-data
+  namespace: jdix-system
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: ["*.sbx.example.com"]
+      secretName: jdix-sbx-wildcard-tls
+  rules:
+    # An Ingress wildcard matches exactly one label, which is the same rule the
+    # gateway's own parser applies: sbx-abc.sbx.example.com matches,
+    # a.b.sbx.example.com does not, and the bare sbx.example.com does not
+    # either — give it its own rule if it needs to serve anything.
+    - host: "*.sbx.example.com"
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: jdix-gateway
+                port: { number: 8090 }
