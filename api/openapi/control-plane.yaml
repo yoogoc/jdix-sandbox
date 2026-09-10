@@ -388,8 +388,13 @@ components:
         token:
           type: string
           description: |
-            The data-plane credential, returned only from `createSandbox` and
-            never stored. Keep it if you intend to come back to this sandbox.
+            The data-plane credential. Prefix every data-plane call's
+            `Authorization: Bearer` with it.
+
+            Returned by `createSandbox` and by `getSandbox`, so a caller that
+            lost it can reattach to a sandbox it owns. `listSandboxes` omits it.
+            It is cleared once the sandbox expires or fails, at which point
+            nothing would honour it anyway.
         expiresAt: { type: string, format: date-time }
         coldStart:
           type: boolean

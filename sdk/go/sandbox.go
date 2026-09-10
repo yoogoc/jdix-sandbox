@@ -165,11 +165,11 @@ func (c *Client) newSandbox(j *sandboxJSON) *Sandbox {
 	return s
 }
 
-// Get fetches an existing sandbox.
+// Get fetches an existing sandbox, ready to execute against.
 //
-// The data-plane token is issued once, at creation, and is not stored by the
-// control plane, so a sandbox retrieved this way can be inspected but not
-// executed against. Keep the token from Create if you need to come back to it.
+// The data-plane token comes back with it, so a process that lost the one from
+// Create — a restart, a different worker picking up the job — can reattach by
+// id alone. List does not carry tokens; use Get for the ones you mean to use.
 func (c *Client) Get(ctx context.Context, id string) (*Sandbox, error) {
 	var out sandboxJSON
 	if err := c.do(ctx, http.MethodGet, "/v1/sandboxes/"+url.PathEscape(id), nil, &out, nil); err != nil {

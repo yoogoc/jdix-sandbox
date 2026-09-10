@@ -105,6 +105,22 @@ type SandboxStatus struct {
 	ColdStart bool   `json:"coldStart,omitempty"`
 	Endpoint  string `json:"endpoint,omitempty"`
 
+	// Token is the sandbox's data-plane credential, in the clear.
+	//
+	// It has to live somewhere the API server can hand back, because the
+	// component that mints it is the controller — binding is the moment a
+	// sandbox acquires an identity — and the component that gives it to the
+	// tenant is jdix-apiserver. Every route between the two runs through a
+	// stored object, so "issue it without storing it" is not on offer; what is
+	// on offer is being clear about where it sits.
+	//
+	// Reading it needs get on sandboxes in the tenant's namespace, which is not
+	// something a tenant has: they reach sandboxes through the API. That is the
+	// same bargain the Pod's control-plane token already makes (see
+	// controller/podspec.go), and it is cleared the moment the sandbox is no
+	// longer usable.
+	Token string `json:"token,omitempty"`
+
 	BoundAt   *metav1.Time `json:"boundAt,omitempty"`
 	ExpiresAt *metav1.Time `json:"expiresAt,omitempty"`
 

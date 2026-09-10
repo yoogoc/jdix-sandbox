@@ -166,6 +166,7 @@ status:
   isolationTier: userns
   coldStart: false
   endpoint: https://api.example.com/s/sbx-01j8xk7m2q   # 见 §8；SDK 只拼接，不解析
+  token: sbt_…                                        # 数据面凭据，明文；过期/失败时清空
   boundAt / expiresAt
   conditions: [ { type: Ready, status: "True", … } ]
 ```
@@ -656,6 +657,14 @@ GET    /v1/ports
 POST   /v1/keepalive             续期 TTL
 GET    /v1/health                存活 + 资源用量快照
 ```
+
+### 7.3.1 数据面 token 的去处
+
+controller 在 bind 时 mint token 交给 execd，同时写进 `status.token`，apiserver 从那里读出来返回给租户。**必须两边一致**，否则租户拿到的凭据沙箱不认——曾经 controller mint 完就丢，`status` 里根本没有这个字段，于是每一次数据面调用都是 `invalid or missing sandbox token`，而错误信息（故意含糊，避免被当成沙箱是否存在的探针）完全指不到病根。现在有测试直接断言"给 execd 的"和"写进 status 的"是同一个值。
+
+**明文存 etcd 是个明摆着的取舍。** mint 它的是 controller（bind 才是沙箱获得身份的时刻），交给租户的是 apiserver，两者之间任何一条路都要经过一个被持久化的对象——所以"发出去但不存"不在选项里，能做的是把它存在哪儿说清楚。读它需要租户 namespace 下 sandboxes 的 get 权限，而租户没有这个权限（他们只能走 API）。这和 Pod spec 里明文躺着的控制面 token 是同一笔交易（§04）。沙箱过期或失败时立即清空——那时它已经什么都认证不了了。
+
+**返回位置是个决定，不是巧合**：`createSandbox` 和 `getSandbox` 返回（后者让丢了 token 的进程能按 id 重新接上），`listSandboxes` 不返回——一次响应泄漏一个凭据，比泄漏该租户手上全部凭据要小。
 
 ### 7.4 execd 控制面 API（集群内，`:8081`）
 

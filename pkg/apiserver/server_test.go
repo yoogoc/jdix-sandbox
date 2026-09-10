@@ -222,6 +222,7 @@ func TestCreateWaitsForTheControllerToFinish(t *testing.T) {
 						exp := metav1.NewTime(time.Now().Add(10 * time.Minute))
 						s.Status.Phase = sbxv1.PhaseRunning
 						s.Status.Endpoint = "https://" + s.Name + ".sbx.example.com"
+						s.Status.Token = "sbt_from_the_controller"
 						s.Status.IsolationTier = sbxv1.TierUserns
 						s.Status.ExpiresAt = &exp
 						_ = f.kube.Status().Update(context.Background(), s)
@@ -240,6 +241,49 @@ func TestCreateWaitsForTheControllerToFinish(t *testing.T) {
 	}
 	if got.Endpoint == "" || got.ExpiresAt == nil || got.IsolationTier != string(sbxv1.TierUserns) {
 		t.Fatalf("a ready sandbox must carry everything the SDK needs: %+v", got)
+	}
+	if got.Token != "sbt_from_the_controller" {
+		t.Fatalf("token %q: without it the endpoint above is unusable and every data-plane call is a 401", got.Token)
+	}
+}
+
+// The token is a credential, so where it appears is a decision rather than an
+// accident: on the two single-sandbox reads, and not in a bulk listing.
+func TestTokenIsReturnedByGetButNotByList(t *testing.T) {
+	f := newFixture(t)
+	f.srv.ReadyTimeout = time.Millisecond
+
+	resp := f.do(http.MethodPost, "/v1/sandboxes", f.key, CreateSandboxRequest{Template: "py312"})
+	id := decode[SandboxResponse](t, resp).ID
+
+	var sbx sbxv1.Sandbox
+	if err := f.kube.Get(context.Background(), client.ObjectKey{Namespace: tenantNS, Name: id}, &sbx); err != nil {
+		t.Fatal(err)
+	}
+	sbx.Status.Phase = sbxv1.PhaseRunning
+	sbx.Status.Token = "sbt_from_the_controller"
+	if err := f.kube.Status().Update(context.Background(), &sbx); err != nil {
+		t.Fatal(err)
+	}
+
+	one := decode[SandboxResponse](t, f.do(http.MethodGet, "/v1/sandboxes/"+id, f.key, nil))
+	if one.Token != "sbt_from_the_controller" {
+		t.Errorf("get returned token %q; a caller that lost it cannot reattach", one.Token)
+	}
+
+	var listed struct {
+		Sandboxes []SandboxResponse `json:"sandboxes"`
+	}
+	body := f.do(http.MethodGet, "/v1/sandboxes", f.key, nil)
+	defer body.Body.Close()
+	if err := json.NewDecoder(body.Body).Decode(&listed); err != nil {
+		t.Fatal(err)
+	}
+	if len(listed.Sandboxes) != 1 {
+		t.Fatalf("listed %d sandboxes", len(listed.Sandboxes))
+	}
+	if listed.Sandboxes[0].Token != "" {
+		t.Errorf("list leaked a credential: %q", listed.Sandboxes[0].Token)
 	}
 }
 

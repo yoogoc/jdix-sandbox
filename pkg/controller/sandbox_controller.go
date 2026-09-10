@@ -371,6 +371,10 @@ func (r *SandboxReconciler) bind(ctx context.Context, sbx *sbxv1.Sandbox) (ctrl.
 	sbx.Status.IsolationTier = sbxv1.IsolationTier(resp.IsolationTier)
 	sbx.Status.BoundAt = &boundAt
 	sbx.Status.ExpiresAt = &expiresAt
+	// The same token execd was just given. Without this the tenant has no way
+	// to obtain it, and every data-plane call is a 401 that looks like a bug in
+	// the caller.
+	sbx.Status.Token = token
 	if r.EndpointFor != nil {
 		sbx.Status.Endpoint = r.EndpointFor(sbx.Name)
 	}
@@ -412,6 +416,9 @@ func (r *SandboxReconciler) expire(ctx context.Context, sbx *sbxv1.Sandbox, reas
 	}
 	sbx.Status.Phase = sbxv1.PhaseExpired
 	sbx.Status.Reason = reason
+	// The Pod that honoured this token is gone, so keeping it would leave a
+	// credential in etcd that authenticates nothing.
+	sbx.Status.Token = ""
 	return requeueOnConflict(r.Status().Update(ctx, sbx))
 }
 
@@ -419,6 +426,7 @@ func (r *SandboxReconciler) fail(ctx context.Context, sbx *sbxv1.Sandbox, reason
 	log.FromContext(ctx).Info("sandbox failed", "sandbox", sbx.Name, "reason", reason, "message", msg)
 	sbx.Status.Phase = sbxv1.PhaseFailed
 	sbx.Status.Reason = reason + ": " + msg
+	sbx.Status.Token = ""
 	return requeueOnConflict(r.Status().Update(ctx, sbx))
 }
 

@@ -494,3 +494,66 @@ func TestAPodWithoutATokenIsNotClaimed(t *testing.T) {
 		t.Fatalf("expected a cold start alongside the unusable Pod, got %d Pods", len(listPods(t, c)))
 	}
 }
+
+// The token execd is told to honour has to be the token the tenant is given.
+// Nothing else in the system compares the two: for a long time the controller
+// minted one, handed it to execd and dropped it, and every data-plane call came
+// back "invalid or missing sandbox token" with no hint as to why.
+func TestSandboxPublishesTheTokenItGaveExecd(t *testing.T) {
+	tpl := approvedTemplate("py312")
+	pod := warmPod("warm-1", "py312", tpl.Status.Hash, string(bwrap.TierUserns), true)
+	c := newFakeClient(t, tpl, pod, newSandbox("sbx-1", "py312"))
+	b := &fakeBinder{}
+	r := newSandboxReconciler(t, c, b)
+
+	got := drive(t, r, c, "sbx-1", 6)
+	if got.Status.Phase != sbxv1.PhaseRunning {
+		t.Fatalf("phase %q reason %q", got.Status.Phase, got.Status.Reason)
+	}
+	if len(b.calls) != 1 {
+		t.Fatalf("bind called %d times", len(b.calls))
+	}
+	sentToExecd := b.calls[0].Token
+	if sentToExecd == "" {
+		t.Fatal("execd was given no token to honour")
+	}
+	if got.Status.Token != sentToExecd {
+		t.Errorf("status.token is %q but execd was told %q; the tenant would be handed a credential the sandbox rejects",
+			got.Status.Token, sentToExecd)
+	}
+}
+
+// A credential that nothing would honour has no business staying in etcd.
+func TestSandboxClearsTheTokenWhenItStopsBeingUsable(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		drive func(t *testing.T) *sbxv1.Sandbox
+	}{
+		{"expired", func(t *testing.T) *sbxv1.Sandbox {
+			tpl := approvedTemplate("py312")
+			pod := warmPod("warm-1", "py312", tpl.Status.Hash, string(bwrap.TierUserns), true)
+			c := newFakeClient(t, tpl, pod, newSandbox("sbx-1", "py312"))
+			r := newSandboxReconciler(t, c, &fakeBinder{})
+			if got := drive(t, r, c, "sbx-1", 6); got.Status.Token == "" {
+				t.Fatal("no token to clear")
+			}
+			// Walk past the deadline and let the expiry pass run.
+			r.Now = func() time.Time { return time.Now().Add(24 * time.Hour) }
+			return drive(t, r, c, "sbx-1", 3)
+		}},
+		{"failed", func(t *testing.T) *sbxv1.Sandbox {
+			tpl := approvedTemplate("py312")
+			pod := warmPod("warm-1", "py312", tpl.Status.Hash, string(bwrap.TierUserns), true)
+			c := newFakeClient(t, tpl, pod, newSandbox("sbx-1", "py312"))
+			r := newSandboxReconciler(t, c, &fakeBinder{err: errBindRejected})
+			return drive(t, r, c, "sbx-1", 6)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.drive(t)
+			if got.Status.Token != "" {
+				t.Errorf("phase %q still carries a token", got.Status.Phase)
+			}
+		})
+	}
+}

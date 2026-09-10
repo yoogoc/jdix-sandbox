@@ -96,11 +96,12 @@ class Client:
         return sbx
 
     def get(self, sandbox_id: str) -> "Sandbox":
-        """Fetch an existing sandbox.
+        """Fetch an existing sandbox, ready to execute against.
 
-        The data-plane token is issued once, at creation, and is not stored by
-        the control plane. A sandbox retrieved this way can be inspected but not
-        executed against unless you kept its token.
+        The data-plane token comes back with it, so a process that lost the one
+        from ``create`` — a restart, another worker picking up the job — can
+        reattach by id alone. ``list`` does not carry tokens; use ``get`` for
+        the ones you mean to use.
         """
         payload = self._t.json("GET", f"/v1/sandboxes/{quote(sandbox_id)}")
         return Sandbox(self._t, _info_from_json(payload))
