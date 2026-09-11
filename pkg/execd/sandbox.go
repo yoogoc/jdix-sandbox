@@ -12,10 +12,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
 	"path"
+	"strings"
+	"sync"
 	"time"
 
 	"jdix.io/sandbox/pkg/api"
@@ -29,17 +32,50 @@ import (
 // Launcher starts the sandbox process. Production runs bubblewrap; tests
 // substitute a launcher that runs jdix-init directly, which exercises every
 // line of the bind path that does not need a kernel namespace.
-type Launcher func(ctx context.Context, argv []string, files []*os.File) (*exec.Cmd, error)
+type Launcher func(ctx context.Context, argv []string, files []*os.File, stderr io.Writer) (*exec.Cmd, error)
 
 // BwrapLauncher is the production launcher.
 func BwrapLauncher(bwrapPath string) Launcher {
-	return func(ctx context.Context, argv []string, files []*os.File) (*exec.Cmd, error) {
+	return func(ctx context.Context, argv []string, files []*os.File, stderr io.Writer) (*exec.Cmd, error) {
 		cmd := exec.CommandContext(ctx, bwrapPath, argv...)
 		cmd.ExtraFiles = files
 		cmd.Env = []string{"PATH=/usr/bin:/bin", "LANG=C.UTF-8"}
-		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+		cmd.Stdout, cmd.Stderr = os.Stdout, stderr
 		return cmd, cmd.Start()
 	}
+}
+
+// tail keeps the last few kilobytes a process wrote to stderr.
+//
+// When a sandbox fails to come up, what the caller sees is that jdix-init's
+// socket never appeared — true, useless, and pointing nowhere near the cause.
+// bwrap has usually already said exactly what went wrong ("Can't mkdir ...:
+// Read-only file system" for a nested mount whose mount point does not exist in
+// its parent's source), and that line belongs in the error rather than only in
+// the Pod's logs.
+type tail struct {
+	mu  sync.Mutex
+	buf []byte
+}
+
+const tailMax = 4 << 10
+
+func (t *tail) Write(p []byte) (int, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.buf = append(t.buf, p...)
+	if len(t.buf) > tailMax {
+		t.buf = t.buf[len(t.buf)-tailMax:]
+	}
+	return len(p), nil
+}
+
+// String returns the last line, which is the one that says what failed.
+func (t *tail) String() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	lines := strings.Split(strings.TrimSpace(string(t.buf)), "\n")
+	return strings.TrimSpace(lines[len(lines)-1])
 }
 
 // Config is everything execd needs that does not come from a bind request.
@@ -111,7 +147,9 @@ func (s *Server) launch(ctx context.Context, req api.BindRequest) (*sandbox, err
 		files = append(files, filter)
 	}
 	runCtx, cancel := context.WithCancel(context.Background())
-	cmd, err := s.cfg.Launcher(runCtx, argv, files)
+	// Forwarded to the Pod's logs as before and kept, so a failure can say why.
+	diag := &tail{}
+	cmd, err := s.cfg.Launcher(runCtx, argv, files, io.MultiWriter(os.Stderr, diag))
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("start sandbox: %w", err)
@@ -127,6 +165,9 @@ func (s *Server) launch(ctx context.Context, req api.BindRequest) (*sandbox, err
 	if err := waitForSocket(runCtx, sockPath, s.cfg.InitDial); err != nil {
 		cancel()
 		_ = cmd.Process.Kill()
+		if last := diag.String(); last != "" {
+			return nil, fmt.Errorf("sandbox did not come up: %s", last)
+		}
 		return nil, fmt.Errorf("sandbox did not come up: %w", err)
 	}
 

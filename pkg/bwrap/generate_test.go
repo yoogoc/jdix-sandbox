@@ -268,3 +268,93 @@ func TestFilesystemTierIsNotComparableWithTheLadder(t *testing.T) {
 		}
 	}
 }
+
+// A writable directory holding read-only ones is a shape tenants need — an
+// agent's session directory, say, where it may create new sessions but not
+// rewrite old ones. bwrap applies binds in order and a later bind covers an
+// earlier one, so the argv has to put parents first however the request was
+// written.
+func TestNestedMountsAreOrderedParentFirst(t *testing.T) {
+	const sessions = "/workspace/users/u/.pi/agent/sessions"
+	l := DefaultLayout()
+	p := DefaultPolicy(TierFilesystem)
+	p.Volumes = map[string]string{"v": "/var/lib/jdix/vol/v"}
+	p.IsDirFunc = func(string) bool { return false }
+
+	// Deliberately written child-first, which is how a generated request often
+	// comes out.
+	mounts := []api.Mount{
+		{Path: sessions + "/--projects-2173--", Source: api.MountSource{Volume: "v", SubPath: "s/2173"}, ReadOnly: true},
+		{Path: sessions + "/--projects-2334--", Source: api.MountSource{Volume: "v", SubPath: "s/2334"}, ReadOnly: true},
+		{Path: sessions, Source: api.MountSource{Volume: "v", SubPath: "s"}},
+		{Path: "/workspace/projects/2490", Source: api.MountSource{Volume: "v", SubPath: "p/2490"}},
+	}
+	p.SourceFDs = map[string]int{}
+	for i, m := range mounts {
+		p.SourceFDs[m.Path] = 3 + i
+	}
+	argv, err := Generate(api.FilesystemSpec{
+		Workspace: api.Workspace{Path: "/workspace"}, Mounts: mounts,
+	}, p, l)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	at := func(target string) int {
+		for i, a := range argv {
+			if a == target && i > 0 && strings.HasSuffix(argv[i-2], "-fd") {
+				return i
+			}
+		}
+		t.Fatalf("%s is not mounted at all:\n  %s", target, strings.Join(argv, " "))
+		return -1
+	}
+	parent := at(sessions)
+	for _, child := range []string{sessions + "/--projects-2173--", sessions + "/--projects-2334--"} {
+		if at(child) < parent {
+			t.Errorf("%s is bound before its parent %s, so the parent would cover it", child, sessions)
+		}
+	}
+	// The workspace itself is bound before anything nested inside it, or the
+	// same problem applies one level up.
+	for i, a := range argv {
+		if a == "/workspace" && argv[i-2] == "--bind" {
+			if i > parent {
+				t.Error("the workspace bind comes after a mount nested inside it")
+			}
+			break
+		}
+	}
+}
+
+// Ordering must not depend on how the request happened to be written: the argv
+// feeds the template hash, and an unstable one would roll the warm pool for no
+// reason.
+func TestMountOrderIsStableAcrossRequestOrder(t *testing.T) {
+	l := DefaultLayout()
+	mk := func(mounts []api.Mount) string {
+		p := DefaultPolicy(TierFilesystem)
+		p.Volumes = map[string]string{"v": "/var/lib/jdix/vol/v"}
+		p.IsDirFunc = func(string) bool { return false }
+		p.SourceFDs = map[string]int{}
+		for _, m := range mounts {
+			p.SourceFDs[m.Path] = 3
+		}
+		argv, err := Generate(api.FilesystemSpec{
+			Workspace: api.Workspace{Path: "/workspace"}, Mounts: mounts,
+		}, p, l)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.Join(argv, " ")
+	}
+	a := []api.Mount{
+		{Path: "/workspace/b/x", Source: api.MountSource{Volume: "v", SubPath: "1"}},
+		{Path: "/workspace/a", Source: api.MountSource{Volume: "v", SubPath: "2"}},
+		{Path: "/workspace/b", Source: api.MountSource{Volume: "v", SubPath: "3"}},
+	}
+	b := []api.Mount{a[2], a[0], a[1]}
+	if mk(a) != mk(b) {
+		t.Error("the same mounts written in a different order produce a different argv")
+	}
+}

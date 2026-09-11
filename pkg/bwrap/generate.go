@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"sort"
+	"strings"
 
 	"jdix.io/sandbox/pkg/api"
 )
@@ -80,7 +82,7 @@ func Generate(spec api.FilesystemSpec, p Policy, l Layout) ([]string, error) {
 	ws := workspacePath(spec)
 	add("--bind", l.WorkspaceDir, ws)
 
-	for _, m := range spec.Mounts {
+	for _, m := range orderedMounts(spec.Mounts) {
 		src := path.Join(p.Volumes[m.Source.Volume], m.Source.SubPath)
 		if fd, ok := p.SourceFDs[m.Path]; ok {
 			if m.ReadOnly {
@@ -142,6 +144,29 @@ func (p Policy) isDir(target string) bool {
 	}
 	fi, err := os.Stat(target)
 	return err == nil && fi.IsDir()
+}
+
+// orderedMounts returns the mounts with parents ahead of their children.
+//
+// bwrap applies binds in argv order and a later bind covers an earlier one, so
+// a child listed before its parent would be mounted and then hidden — silently,
+// with the parent's own content showing through where the child should be. The
+// tenant's order carries no meaning, so it is replaced with one that does.
+//
+// Depth first, then the path itself: a child is always strictly deeper than its
+// parent, and the tiebreak keeps the argv stable for a given spec, which
+// matters because it feeds the template hash.
+func orderedMounts(mounts []api.Mount) []api.Mount {
+	out := make([]api.Mount, len(mounts))
+	copy(out, mounts)
+	sort.SliceStable(out, func(i, j int) bool {
+		di, dj := strings.Count(out[i].Path, "/"), strings.Count(out[j].Path, "/")
+		if di != dj {
+			return di < dj
+		}
+		return out[i].Path < out[j].Path
+	})
+	return out
 }
 
 func itoa(n int) string {

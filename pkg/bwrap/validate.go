@@ -146,13 +146,12 @@ func (p Policy) Validate(spec api.FilesystemSpec, l Layout) error {
 		}
 		seen[m.Path] = true
 
-		if p.Tier == TierFilesystem {
-			for j := 0; j < i; j++ {
-				if overlaps(m.Path, spec.Mounts[j].Path) {
-					return verr(field, m.Path, "nested mount targets are not supported in filesystem mode")
-				}
-			}
-		}
+		// Nested targets are allowed: a writable directory holding read-only
+		// ones is a shape tenants actually need. Generate orders them so a
+		// parent is applied before its children, or the parent would cover
+		// them. What a nested mount cannot do is conjure its own mount point:
+		// the directory has to exist in the parent's source, and it cannot be
+		// created there when that parent is read-only.
 		for _, prot := range p.protectedTargets(l) {
 			if overlaps(m.Path, prot) {
 				return verr(field, m.Path, "overlaps platform path "+prot)
