@@ -403,13 +403,22 @@ components:
 
     IsolationTier:
       type: string
-      enum: [userns, capadmin, chroot]
+      enum: [filesystem, userns, capadmin, chroot]
       description: |
         What the node running this sandbox can actually enforce.
 
-        `userns` is the target: an unprivileged user namespace, no extra
-        capability. `capadmin` relies on CAP_SYS_ADMIN. `chroot` has no mount
-        namespace at all and cannot honour `filesystem.mounts`.
+        `userns`, `capadmin` and `chroot` are a ladder, strongest first:
+        `userns` is an unprivileged user namespace with no extra capability,
+        `capadmin` relies on CAP_SYS_ADMIN, and `chroot` has no mount namespace
+        at all and cannot honour `filesystem.mounts`.
+
+        `filesystem` is not a rung on that ladder but a separate mode, and the
+        values are not comparable. It keeps the user namespace that makes
+        unprivileged mounts possible and gives up the sandbox's own PID
+        namespace, so the Pod needs no user namespace of its own — which is
+        what lets it mount a shared network volume at all, since the runtime
+        would otherwise try to ID-map one and NFS cannot be ID-mapped. Process
+        isolation is then the container's rather than the sandbox's.
 
     CreateSandboxRequest:
       type: object

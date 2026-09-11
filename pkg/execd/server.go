@@ -10,7 +10,9 @@ import (
 	"time"
 
 	"jdix.io/sandbox/pkg/api"
+	"jdix.io/sandbox/pkg/bwrap"
 	"jdix.io/sandbox/pkg/isolation"
+	"jdix.io/sandbox/pkg/reaper"
 )
 
 // Server holds the node measurement and, once bound, the live sandbox.
@@ -32,6 +34,15 @@ type Server struct {
 	// onExpire lets main terminate the process when the TTL fires, so the Pod
 	// disappears rather than lingering as an empty shell.
 	onExpire func(reason string)
+
+	// reaper collects processes that outlive the sandbox, and is non-nil only
+	// where execd can actually inherit them. In filesystem mode the sandbox
+	// shares the container's PID namespace, so anything jdix-init does not
+	// adopt — orphans of a crashed jdix-init, or of the window before it sets
+	// itself subreaper — re-parents to execd as PID 1. Nothing else in this
+	// process waits: the bwrap child is registered here too, or the two would
+	// race for its exit status and one of them would lose it (DESIGN §06).
+	reaper *reaper.Reaper
 }
 
 func New(log *slog.Logger, cfg Config, probe isolation.Result, internalToken string) *Server {
@@ -44,8 +55,17 @@ func New(log *slog.Logger, cfg Config, probe isolation.Result, internalToken str
 	if cfg.UID == 0 {
 		cfg.UID, cfg.GID = 1000, 1000
 	}
-	return &Server{log: log, cfg: cfg, startedAt: time.Now(), probe: probe, internalToken: internalToken}
+	s := &Server{log: log, cfg: cfg, startedAt: time.Now(), probe: probe, internalToken: internalToken}
+	if cfg.Tier == bwrap.TierFilesystem {
+		s.reaper = reaper.NewReaper()
+	}
+	return s
 }
+
+// Reaper exposes the process reaper so main can run it for the process's
+// lifetime. Nil outside filesystem mode, where the sandbox has a PID namespace
+// of its own and jdix-init is the only thing that inherits anything.
+func (s *Server) Reaper() *reaper.Reaper { return s.reaper }
 
 // SetOnExpire registers the shutdown hook used when a TTL elapses.
 func (s *Server) SetOnExpire(f func(reason string)) { s.onExpire = f }

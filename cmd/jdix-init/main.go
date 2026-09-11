@@ -20,16 +20,32 @@ import (
 	"time"
 
 	"jdix.io/sandbox/pkg/initd"
+	"jdix.io/sandbox/pkg/isolation"
 )
 
 func main() {
 	var (
+		subreaper = flag.Bool("subreaper", false, "adopt orphaned children in the container PID namespace")
 		socket    = flag.String("socket", "/run/jdix/init.sock", "unix socket to serve the data plane on")
 		workspace = flag.String("workspace", "/workspace", "default working directory for commands")
 		dropTo    = flag.String("drop-to", "", "uid:gid to drop to before serving (capadmin tier only)")
 		logLevel  = flag.String("log-level", "info", "debug|info|warn|error")
 	)
 	flag.Parse()
+	if *subreaper {
+		if err := isolation.CheckFilesystemView(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		if err := isolation.BecomeSubreaper(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		if err := isolation.ProtectSupervisor(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	}
 
 	log := newLogger(*logLevel).With("component", "jdix-init", "pid", os.Getpid())
 

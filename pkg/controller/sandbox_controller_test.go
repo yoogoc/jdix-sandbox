@@ -627,3 +627,24 @@ func TestPermanentSandboxGetsNoDeadline(t *testing.T) {
 		t.Errorf("phase %q after a hundred days; it should still be running", after.Status.Phase)
 	}
 }
+
+// A node that measured the legacy userns tier must not be allowed to serve a
+// filesystem-mode template. The two are different isolation models, not
+// different strengths of the same one, and substituting either for the other
+// would be silent — the sandbox would report Running and the guarantee the
+// template asked for would simply not be there
+// (docs/NFS-CSI-FILESYSTEM-ISOLATION.md §8, third step).
+func TestFilesystemTemplateRefusesALegacyTieredPod(t *testing.T) {
+	tpl := approvedTemplate("fs")
+	tpl.Spec.MinIsolationTier = ""
+	tpl.Spec.FilesystemIsolation = "bwrap"
+	// A warm Pod whose node measured the old tier, which ranks "higher".
+	pod := warmPod("warm-1", "fs", tpl.Status.Hash, string(bwrap.TierUserns), true)
+	c := newFakeClient(t, tpl, pod, newSandbox("sbx-1", "fs"))
+	r := newSandboxReconciler(t, c, &fakeBinder{tier: bwrap.TierUserns})
+
+	got := drive(t, r, c, "sbx-1", 6)
+	if got.Status.Phase == sbxv1.PhaseRunning {
+		t.Fatalf("a userns Pod served a filesystem template; tier=%q", got.Status.IsolationTier)
+	}
+}

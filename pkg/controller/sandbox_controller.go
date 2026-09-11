@@ -249,7 +249,7 @@ func (r *SandboxReconciler) claimWarmPod(ctx context.Context, sbx *sbxv1.Sandbox
 		// unmeasured Pod is skipped rather than probed here: probing on the
 		// request path is exactly the latency the warm pool exists to avoid.
 		tier := bwrap.Tier(p.Labels[sbxv1.LabelIsolationTier])
-		if tier == "" || !tier.AtLeast(bwrap.Tier(tpl.Spec.MinIsolationTier)) {
+		if tier == "" || !tier.AtLeast(bwrap.Tier(tpl.Spec.RequiredIsolation())) {
 			continue
 		}
 		// A Pod with no control-plane credential was built by a different
@@ -337,13 +337,13 @@ func (r *SandboxReconciler) bind(ctx context.Context, sbx *sbxv1.Sandbox) (ctrl.
 			return ctrl.Result{RequeueAfter: requeueBinding}, nil
 		}
 	}
-	if !tier.AtLeast(bwrap.Tier(tpl.Spec.MinIsolationTier)) {
+	if !tier.AtLeast(bwrap.Tier(tpl.Spec.RequiredIsolation())) {
 		// Refuse rather than run with weaker isolation than promised. A silent
 		// downgrade of a security guarantee is worse than a failed request.
 		_ = r.Delete(ctx, &pod)
 		return r.fail(ctx, sbx, "IsolationUnavailable", fmt.Sprintf(
 			"node %s can only provide %q isolation but the template requires %q",
-			pod.Spec.NodeName, tier, tpl.Spec.MinIsolationTier))
+			pod.Spec.NodeName, tier, tpl.Spec.RequiredIsolation()))
 	}
 
 	token := r.newToken()

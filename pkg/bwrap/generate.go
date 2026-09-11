@@ -1,6 +1,7 @@
 package bwrap
 
 import (
+	"fmt"
 	"os"
 	"path"
 
@@ -28,21 +29,22 @@ func Generate(spec api.FilesystemSpec, p Policy, l Layout) ([]string, error) {
 	add := func(xs ...string) { a = append(a, xs...) }
 
 	// ── namespaces ────────────────────────────────────────────────────────
-	if p.Tier == TierUserns {
+	if p.Tier == TierUserns || p.Tier == TierFilesystem {
 		add("--unshare-user")
 	}
-	add("--unshare-ipc", "--unshare-pid", "--unshare-uts")
-	// cgroup namespaces are not universal; -try degrades instead of failing.
-	add("--unshare-cgroup-try")
+	if p.Tier != TierFilesystem {
+		add("--unshare-ipc", "--unshare-pid", "--unshare-uts", "--unshare-cgroup-try")
+	}
+
 	// Never --unshare-net: the sandbox needs egress. Network isolation is a
 	// NetworkPolicy concern at the Pod level (DESIGN.md §08).
 
-	if p.Tier == TierUserns {
+	if p.Tier == TierUserns || p.Tier == TierFilesystem {
 		// bwrap can only map ids when it owns a user namespace. Under
 		// TierCapAdmin jdix-init drops privileges itself instead.
 		add("--uid", itoa(p.UID), "--gid", itoa(p.GID))
 	}
-	if p.Hostname != "" {
+	if p.Hostname != "" && p.Tier != TierFilesystem {
 		add("--hostname", p.Hostname)
 	}
 
@@ -59,7 +61,12 @@ func Generate(spec api.FilesystemSpec, p Policy, l Layout) ([]string, error) {
 	add("--ro-bind", path.Join(l.SkelDir, "group"), "/etc/group")
 	add("--ro-bind", path.Join(l.SkelDir, "resolv.conf"), "/etc/resolv.conf")
 
-	add("--proc", "/proc")
+	if p.Tier == TierFilesystem {
+		add("--ro-bind", "/proc", "/proc")
+		add("--cap-drop", "ALL")
+	} else {
+		add("--proc", "/proc")
+	}
 	add("--dev", "/dev")
 	add("--tmpfs", "/tmp")
 	add("--tmpfs", "/run")
@@ -75,7 +82,15 @@ func Generate(spec api.FilesystemSpec, p Policy, l Layout) ([]string, error) {
 
 	for _, m := range spec.Mounts {
 		src := path.Join(p.Volumes[m.Source.Volume], m.Source.SubPath)
-		if m.ReadOnly {
+		if fd, ok := p.SourceFDs[m.Path]; ok {
+			if m.ReadOnly {
+				add("--ro-bind-fd", itoa(fd), m.Path)
+			} else {
+				add("--bind-fd", itoa(fd), m.Path)
+			}
+		} else if p.Tier == TierFilesystem {
+			return nil, fmt.Errorf("mount %s: source directory has not been pinned", m.Path)
+		} else if m.ReadOnly {
 			add("--ro-bind", src, m.Path)
 		} else {
 			add("--bind", src, m.Path)
@@ -102,14 +117,19 @@ func Generate(spec api.FilesystemSpec, p Policy, l Layout) ([]string, error) {
 
 	add("--die-with-parent") // execd dies -> the whole namespace goes with it
 	add("--new-session")     // detach from execd's controlling terminal (TIOCSTI)
-	add("--as-pid-1")        // jdix-init becomes PID 1 and does the reaping
+	if p.Tier != TierFilesystem {
+		add("--as-pid-1")
+	} // jdix-init becomes PID 1 and does the reaping
 
 	add("--", l.InitTarget,
 		"--socket", path.Join(l.IPCMount, InitSocketName),
 		"--workspace", ws)
-	if p.Tier != TierUserns {
+	if p.Tier != TierUserns && p.Tier != TierFilesystem {
 		// No user namespace: jdix-init must drop privileges after mounting.
 		add("--drop-to", itoa(p.UID)+":"+itoa(p.GID))
+	}
+	if p.Tier == TierFilesystem {
+		a = append(a, "--subreaper")
 	}
 	return a, nil
 }

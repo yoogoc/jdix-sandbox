@@ -94,8 +94,15 @@ type SandboxTemplateSpec struct {
 	// MinIsolationTier is a floor, never a preference: a node that measures
 	// below it is not used, even if that means a cold start or a failure.
 	// Silently degrading an isolation guarantee is worse than not serving.
-	// +kubebuilder:default=userns
 	MinIsolationTier IsolationTier `json:"minIsolationTier,omitempty"`
+
+	// FilesystemIsolation selects directory isolation independently of Pod user
+	// namespaces. It is mutually exclusive with the legacy MinIsolationTier.
+	// +kubebuilder:validation:Enum=bwrap
+	FilesystemIsolation string `json:"filesystemIsolation,omitempty"`
+	// PodUserNamespace opts the filesystem mode into Pod UID mapping. Defaults
+	// to false for bwrap; NFS requires false. Legacy templates retain their policy.
+	PodUserNamespace *bool `json:"podUserNamespace,omitempty"`
 
 	// RuntimeClassName is reserved for gVisor or Kata. Empty today; filling it
 	// in later needs a node pool, not an architecture change.
@@ -219,4 +226,16 @@ type SandboxTemplateList struct {
 
 func init() {
 	SchemeBuilder.Register(&SandboxTemplate{}, &SandboxTemplateList{})
+}
+
+// RequiredIsolation preserves the legacy default without defaulting the stored
+// field, which would make it impossible to select the independent filesystem mode.
+func (s SandboxTemplateSpec) RequiredIsolation() IsolationTier {
+	if s.FilesystemIsolation == "bwrap" {
+		return TierFilesystem
+	}
+	if s.MinIsolationTier == "" {
+		return TierUserns
+	}
+	return s.MinIsolationTier
 }

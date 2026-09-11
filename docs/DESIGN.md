@@ -225,13 +225,24 @@ for pod in candidates:
 4. 只能看到 `spec.filesystem` 声明的路径；写入限于 `/workspace` 与显式 rw 挂载点。
 5. 用户命令以非 root、非 Pod 主 uid 运行。
 
-### 3.2 三档隔离
+### 3.2 隔离档位
+
+三档旧梯子，加一个**并列**的 `filesystem` 模式——它不是梯子上的一级。
 
 | Tier | 内核前提 | bwrap 用法 | 说明 |
 |---|---|---|---|
 | **A `userns`** | 允许 unprivileged user namespace | `--unshare-user --unshare-pid --unshare-ipc --unshare-uts --unshare-cgroup` | 目标状态。容器无需额外 capability |
 | **B `capadmin`** | 容器可加 `CAP_SYS_ADMIN` | 同上但不 `--unshare-user` | 强，但必须配 seccomp + AppArmor/SELinux |
 | **C `chroot`** | 仅 `CAP_SYS_CHROOT` 或更少 | 不用 bwrap：chroot + setuid/setgid + 0700 + RLIMIT | 弱。**且不支持 spec 声明的动态挂载**，见 §04.4 |
+| **`filesystem`**（并列） | 同 A，但不需要 Pod user namespace | `--unshare-user` + 只读 bind 容器已有 `/proc`，**不** `--unshare-pid` / `--as-pid-1` | 为共享网络卷而生，见下 |
+
+**为什么要有并列的一档。** Tier A 要求 bwrap 挂一个全新的 procfs，这需要容器 `procMount: Unmasked`，而 Kubernetes 强制 `Unmasked` 必须配 `hostUsers: false`，于是运行时对**所有**卷施加 idmapped mount——NFS 不支持，容器直接起不来。整条链是实测确认的，每一环都单独隔离过变量。
+
+`filesystem` 模式改成只读 bind 容器已有的（带遮蔽的）`/proc`，`Unmasked` 就不再需要，链条从根上断开。代价是放弃沙箱自己的 PID namespace：进程隔离退到容器级，jdix-init 不再是 PID 1，改用 `PR_SET_CHILD_SUBREAPER` 收养后代，execd 作为容器 PID 1 也带一个 reaper 兜底。
+
+**两种写法互斥**：模板要么写 `minIsolationTier`（旧语义原样保留），要么写 `filesystemIsolation: bwrap`，同时写两个会被准入拒绝。`filesystem` 也不能当作 `minIsolationTier` 的取值——它和梯子不可比较，否则节点测出 `userns` 就会去满足新模式的模板，等于静默换掉一种隔离模型。
+
+完整设计、必须成立的保证、以及集群验收记录见 `docs/NFS-CSI-FILESYSTEM-ISOLATION.md`。
 
 Tier C 下第 1、2 条改由"物理不存在"保证：Pod 不挂 SA token，execd 在 Bind 前把 `/opt/jdix` 敏感文件改成 root 属主 `0600`，沙箱以 uid 1000 运行。
 
@@ -483,6 +494,8 @@ bound Pod 无对应 Sandbox（孤儿）      → delete
 ### 5.4 Volume 与 CSI 的约束
 
 支持任意 CSI / NFS 之后有四条硬约束，都会直接影响能不能跑通：
+
+> **与隔离档位的冲突（已解决）**：`minIsolationTier: userns` 会让 Pod 带上 `hostUsers: false`，运行时便对所有卷施加 idmapped mount，而 NFS 等网络文件系统不支持 idmap——于是"RWX 卷"和"userns 档位"互斥，带卷的模板两头都要、两头都拿不到。解法是并列的 `filesystem` 模式（§03.2），它不需要 Pod user namespace。带卷的模板应当用 `filesystemIsolation: bwrap`。
 
 **① 只允许 `ReadOnlyMany` / `ReadWriteMany`，不允许 `ReadWriteOnce`。**
 

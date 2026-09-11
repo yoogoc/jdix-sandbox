@@ -402,7 +402,7 @@ func (s *Server) listTemplates(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, tplResp{
 			Name: t.Name, Admission: string(t.Status.Admission), Reason: t.Status.AdmissionReason,
-			MinTier: string(t.Spec.MinIsolationTier), DefaultTTL: t.Spec.DefaultTTLSeconds,
+			MinTier: string(t.Spec.RequiredIsolation()), DefaultTTL: t.Spec.DefaultTTLSeconds,
 			MaxTTL: t.Spec.MaxTTLSeconds, HasVolumes: t.Status.HasVolumes,
 		})
 	}

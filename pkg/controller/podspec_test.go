@@ -244,3 +244,80 @@ func TestTheHashIsStableAcrossCalls(t *testing.T) {
 			pod.Labels[sbxv1.LabelTemplateHash], first)
 	}
 }
+
+// The whole point of the new mode: the Pod stops asking for a user namespace,
+// so the runtime stops trying to idmap its volumes, so an NFS-backed PVC can be
+// mounted at all (docs/NFS-CSI-FILESYSTEM-ISOLATION.md §2).
+func TestFilesystemModePodDropsTheUserNamespace(t *testing.T) {
+	tpl := approvedTemplate("fs")
+	tpl.Spec.MinIsolationTier = ""
+	tpl.Spec.FilesystemIsolation = "bwrap"
+	pod := BuildPod(tpl, "", PlatformImage{Ref: "img"}, bwrap.DefaultLayout(), "tok")
+
+	if pod.Spec.HostUsers == nil || *pod.Spec.HostUsers != true {
+		t.Errorf("hostUsers = %v; false is what makes the runtime idmap every volume", pod.Spec.HostUsers)
+	}
+	if pm := pod.Spec.Containers[0].SecurityContext.ProcMount; pm != nil && *pm != corev1.DefaultProcMount {
+		t.Errorf("procMount = %v; Unmasked is what requires hostUsers=false", *pm)
+	}
+	sc := pod.Spec.SecurityContext.SeccompProfile
+	if sc == nil || sc.Type != corev1.SeccompProfileTypeLocalhost {
+		t.Errorf("seccomp = %+v; the setup phase needs a targeted profile, never Unconfined", sc)
+	}
+	var told bool
+	for _, a := range pod.Spec.Containers[0].Args {
+		if a == "--filesystem-isolation=bwrap" {
+			told = true
+		}
+	}
+	if !told {
+		t.Error("execd was not told which mode to probe for")
+	}
+}
+
+// A legacy template must keep its old Pod shape. Reinterpreting it as the new
+// mode would silently swap one isolation model for another under a running
+// pool (docs §7).
+func TestLegacyTemplateKeepsItsPodShape(t *testing.T) {
+	tpl := approvedTemplate("legacy")
+	tpl.Spec.MinIsolationTier = sbxv1.TierUserns
+	pod := BuildPod(tpl, "", PlatformImage{Ref: "img"}, bwrap.DefaultLayout(), "tok")
+
+	if pod.Spec.HostUsers == nil || *pod.Spec.HostUsers != false {
+		t.Errorf("hostUsers = %v, want false for the legacy userns tier", pod.Spec.HostUsers)
+	}
+	if pod.Spec.SecurityContext.SeccompProfile.Type != corev1.SeccompProfileTypeUnconfined {
+		t.Error("the legacy tier's seccomp posture changed")
+	}
+}
+
+// The two ways of asking are mutually exclusive, and a template that asks both
+// ways is rejected rather than resolved in some order the author cannot see.
+func TestFilesystemModeAndLegacyTierAreExclusive(t *testing.T) {
+	cases := []struct {
+		name string
+		mod  func(*sbxv1.SandboxTemplate)
+	}{
+		{"both", func(x *sbxv1.SandboxTemplate) {
+			x.Spec.FilesystemIsolation = "bwrap"
+			x.Spec.MinIsolationTier = sbxv1.TierUserns
+		}},
+		{"podUserNamespace without the mode", func(x *sbxv1.SandboxTemplate) {
+			v := true
+			x.Spec.PodUserNamespace = &v
+		}},
+		{"filesystem as a legacy tier", func(x *sbxv1.SandboxTemplate) {
+			x.Spec.MinIsolationTier = sbxv1.TierFilesystem
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tpl := rawTemplate("x", "registry.internal/x@sha256:"+repeat64('a'), tc.mod)
+			got := reconcileTemplate(t, newFakeClient(t, tpl), tpl, "registry.internal")
+			if got.Status.Admission != sbxv1.AdmissionRejected {
+				t.Fatalf("admission %q (%s), want Rejected",
+					got.Status.Admission, got.Status.AdmissionReason)
+			}
+		})
+	}
+}

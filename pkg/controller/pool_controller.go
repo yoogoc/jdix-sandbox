@@ -214,12 +214,12 @@ func (r *PoolReconciler) classify(ctx context.Context, pool *sbxv1.SandboxPool, 
 				continue
 			}
 			tier = measured
-			if !tier.AtLeast(bwrap.Tier(tpl.Spec.MinIsolationTier)) {
+			if !tier.AtLeast(bwrap.Tier(tpl.Spec.RequiredIsolation())) {
 				// This is the point of measuring during supply: the Pod is
 				// discarded now, quietly, instead of failing someone's request.
 				lg.Info("node cannot meet the template's isolation floor",
 					"pod", p.Name, "node", p.Spec.NodeName,
-					"measured", tier, "required", tpl.Spec.MinIsolationTier, "reason", reason)
+					"measured", tier, "required", tpl.Spec.RequiredIsolation(), "reason", reason)
 				st.stuck = append(st.stuck, p)
 				continue
 			}

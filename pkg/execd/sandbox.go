@@ -20,17 +20,23 @@ import (
 
 	"jdix.io/sandbox/pkg/api"
 	"jdix.io/sandbox/pkg/bwrap"
+	"jdix.io/sandbox/pkg/isolation"
+	"jdix.io/sandbox/pkg/reaper"
+	"jdix.io/sandbox/pkg/safepath"
+	"strconv"
 )
 
 // Launcher starts the sandbox process. Production runs bubblewrap; tests
 // substitute a launcher that runs jdix-init directly, which exercises every
 // line of the bind path that does not need a kernel namespace.
-type Launcher func(ctx context.Context, argv []string) (*exec.Cmd, error)
+type Launcher func(ctx context.Context, argv []string, files []*os.File) (*exec.Cmd, error)
 
 // BwrapLauncher is the production launcher.
 func BwrapLauncher(bwrapPath string) Launcher {
-	return func(ctx context.Context, argv []string) (*exec.Cmd, error) {
+	return func(ctx context.Context, argv []string, files []*os.File) (*exec.Cmd, error) {
 		cmd := exec.CommandContext(ctx, bwrapPath, argv...)
+		cmd.ExtraFiles = files
+		cmd.Env = []string{"PATH=/usr/bin:/bin", "LANG=C.UTF-8"}
 		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 		return cmd, cmd.Start()
 	}
@@ -57,7 +63,10 @@ type sandbox struct {
 	expiresAt time.Time
 	argv      []string
 	cancel    context.CancelFunc
-	ttlTimer  *time.Timer
+	// reaper is the process that owns wait4 here, or nil when this process does
+	// not inherit anything and os/exec may wait for itself.
+	reaper   *reaper.Reaper
+	ttlTimer *time.Timer
 }
 
 // launch builds the argv, starts the sandbox process and waits for jdix-init to
@@ -68,16 +77,50 @@ func (s *Server) launch(ctx context.Context, req api.BindRequest) (*sandbox, err
 	policy.UID, policy.GID = s.cfg.UID, s.cfg.GID
 	policy.Volumes = s.cfg.Volumes
 
+	var files []*os.File
+	defer func() {
+		for _, f := range files {
+			f.Close()
+		}
+	}()
+	if err := policy.Validate(req.Filesystem, s.cfg.Layout); err != nil {
+		return nil, err
+	}
+	if policy.Tier == bwrap.TierFilesystem {
+		policy.SourceFDs = map[string]int{}
+		for _, m := range req.Filesystem.Mounts {
+			f, err := safepath.OpenMount(policy.Volumes[m.Source.Volume], m.Source.SubPath)
+			if err != nil {
+				return nil, err
+			}
+			policy.SourceFDs[m.Path] = 3 + len(files)
+			files = append(files, f)
+		}
+	}
 	argv, err := bwrap.Generate(req.Filesystem, policy, s.cfg.Layout)
 	if err != nil {
 		return nil, fmt.Errorf("build sandbox: %w", err)
 	}
 
+	if policy.Tier == bwrap.TierFilesystem {
+		filter, err := isolation.WorkloadFilter()
+		if err != nil {
+			return nil, err
+		}
+		argv = append([]string{"--seccomp", strconv.Itoa(3 + len(files))}, argv...)
+		files = append(files, filter)
+	}
 	runCtx, cancel := context.WithCancel(context.Background())
-	cmd, err := s.cfg.Launcher(runCtx, argv)
+	cmd, err := s.cfg.Launcher(runCtx, argv, files)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("start sandbox: %w", err)
+	}
+	// Registered after the fact because the launcher starts the process. Safe:
+	// a child that exited in the gap has its status waiting in the reaper, and
+	// Wait looks there first.
+	if s.reaper != nil {
+		s.reaper.Adopt(cmd.Process.Pid)
 	}
 
 	sockPath := path.Join(s.cfg.Layout.IPCDir, bwrap.InitSocketName)
@@ -95,6 +138,7 @@ func (s *Server) launch(ctx context.Context, req api.BindRequest) (*sandbox, err
 		boundAt: time.Now(),
 		argv:    argv,
 		cancel:  cancel,
+		reaper:  s.reaper,
 	}
 	if req.TTLSeconds > 0 {
 		sb.expiresAt = sb.boundAt.Add(time.Duration(req.TTLSeconds) * time.Second)
@@ -138,7 +182,16 @@ func (sb *sandbox) stop(grace time.Duration) {
 	if sb.cmd != nil && sb.cmd.Process != nil {
 		_ = sb.cmd.Process.Signal(os.Interrupt)
 		done := make(chan struct{})
-		go func() { _, _ = sb.cmd.Process.Wait(); close(done) }()
+		// The reaper owns wait4 where it is running, so waiting directly here
+		// would race it for the status and one of the two would see ECHILD.
+		go func() {
+			if sb.reaper != nil {
+				sb.reaper.Wait(sb.cmd.Process.Pid)
+			} else {
+				_, _ = sb.cmd.Process.Wait()
+			}
+			close(done)
+		}()
 		select {
 		case <-done:
 		case <-time.After(grace):

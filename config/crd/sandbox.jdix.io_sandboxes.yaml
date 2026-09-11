@@ -250,6 +250,7 @@ spec:
                 - userns
                 - capadmin
                 - chroot
+                - filesystem
                 type: string
               nodeName:
                 type: string

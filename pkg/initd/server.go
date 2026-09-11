@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"jdix.io/sandbox/pkg/api"
+	"jdix.io/sandbox/pkg/reaper"
 )
 
 // Server holds the configuration handed over at bind time plus the live
@@ -35,7 +36,7 @@ type Server struct {
 	ready     bool
 
 	procs  *procTable
-	reaper *Reaper
+	reaper *reaper.Reaper
 }
 
 // New returns an unconfigured server. It answers /health immediately so execd
@@ -47,13 +48,13 @@ func New(log *slog.Logger, workspace string) *Server {
 		workspace: workspace,
 		env:       map[string]string{},
 		procs:     newProcTable(),
-		reaper:    NewReaper(),
+		reaper:    reaper.NewReaper(),
 	}
 }
 
 // Reaper exposes the process reaper so main can run it for the lifetime of the
 // process. Nothing else in the program may call wait4.
-func (s *Server) Reaper() *Reaper { return s.reaper }
+func (s *Server) Reaper() *reaper.Reaper { return s.reaper }
 
 // Route is one entry of the data-plane surface.
 //
@@ -163,6 +164,11 @@ func (s *Server) handleConfigure(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.Lock()
+	if s.ready {
+		s.mu.Unlock()
+		writeErr(w, http.StatusConflict, "already_configured", "initialization is one-shot")
+		return
+	}
 	s.sandboxID, s.env, s.roots, s.workspace, s.ready = req.SandboxID, env, roots, ws, true
 	s.mu.Unlock()
 

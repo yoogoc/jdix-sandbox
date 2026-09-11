@@ -11,9 +11,11 @@ import "path"
 type Tier string
 
 const (
-	TierUserns   Tier = "userns"   // unprivileged user namespace — target state
-	TierCapAdmin Tier = "capadmin" // CAP_SYS_ADMIN, no user namespace
-	TierChroot   Tier = "chroot"   // no mount namespace at all
+	// TierFilesystem is a distinct capability, not a rank in the legacy hierarchy.
+	TierFilesystem Tier = "filesystem"
+	TierUserns     Tier = "userns"   // unprivileged user namespace — target state
+	TierCapAdmin   Tier = "capadmin" // CAP_SYS_ADMIN, no user namespace
+	TierChroot     Tier = "chroot"   // no mount namespace at all
 )
 
 // Rank orders tiers so a template can demand a minimum.
@@ -30,7 +32,12 @@ func (t Tier) Rank() int {
 }
 
 // AtLeast reports whether t satisfies a template's minIsolationTier.
-func (t Tier) AtLeast(min Tier) bool { return t.Rank() >= min.Rank() }
+func (t Tier) AtLeast(min Tier) bool {
+	if t == TierFilesystem || min == TierFilesystem {
+		return t == min
+	}
+	return t.Rank() > 0 && min.Rank() > 0 && t.Rank() >= min.Rank()
+}
 
 // Layout is where the platform put its own files inside the Pod. None of it is
 // tenant-controlled; it comes from the initContainer and the Pod spec.
@@ -88,6 +95,9 @@ const MaxMounts = 32
 // Policy is the platform-side half of the input: everything the tenant does not
 // get to choose.
 type Policy struct {
+	// SourceFDs pins tenant mount targets to inherited bwrap file descriptors.
+	SourceFDs map[string]int
+
 	Tier            Tier
 	UID, GID        int
 	Hostname        string

@@ -26,12 +26,14 @@ import (
 
 func main() {
 	var (
-		dataAddr     = flag.String("data-addr", ":8080", "data plane listen address")
-		controlAddr  = flag.String("control-addr", ":8081", "cluster-internal control plane listen address")
-		bwrapPath    = flag.String("bwrap", "/opt/jdix/bin/bwrap", "path to the bubblewrap binary")
-		volumesFlag  = flag.String("volumes", "", "template-declared volumes as name=path,name=path")
-		tierOverride = flag.String("tier", "", "skip detection and assert this tier (testing only)")
-		tokenEnv     = flag.String("internal-token-env", "JDIX_CONTROL_TOKEN",
+		filesystemMode = flag.String("filesystem-isolation", "", "bwrap directory view in the container PID namespace")
+		probeChild     = flag.Bool("filesystem-probe-child", false, "internal: validate a completed filesystem view")
+		dataAddr       = flag.String("data-addr", ":8080", "data plane listen address")
+		controlAddr    = flag.String("control-addr", ":8081", "cluster-internal control plane listen address")
+		bwrapPath      = flag.String("bwrap", "/opt/jdix/bin/bwrap", "path to the bubblewrap binary")
+		volumesFlag    = flag.String("volumes", "", "template-declared volumes as name=path,name=path")
+		tierOverride   = flag.String("tier", "", "skip detection and assert this tier (testing only)")
+		tokenEnv       = flag.String("internal-token-env", "JDIX_CONTROL_TOKEN",
 			"environment variable holding this Pod's control-plane token; the controller sets it per Pod")
 		tokenFile = flag.String("internal-token-file", "", "file holding the control-plane token, as an alternative to the environment")
 		allowOpen = flag.Bool("allow-unauthenticated-control", false,
@@ -39,6 +41,28 @@ func main() {
 		logLevel = flag.String("log-level", "info", "debug|info|warn|error")
 	)
 	flag.Parse()
+	if *probeChild {
+		if err := isolation.CheckFilesystemView(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		fmt.Println("filesystem-ok")
+		return
+	}
+	if *filesystemMode != "" && *filesystemMode != "bwrap" {
+		fmt.Fprintln(os.Stderr, "unknown filesystem isolation mode")
+		os.Exit(1)
+	}
+	if *filesystemMode != "" {
+		if *tierOverride != "" {
+			fmt.Fprintln(os.Stderr, "filesystem mode cannot override capability detection")
+			os.Exit(1)
+		}
+		if err := isolation.ProtectSupervisor(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	}
 
 	log := newLogger(*logLevel).With("component", "jdix-execd")
 
@@ -48,7 +72,16 @@ func main() {
 		os.Exit(1)
 	}
 
-	probe := isolation.Detect(context.Background(), *bwrapPath)
+	var probe isolation.Result
+	if *filesystemMode == "bwrap" {
+		probe = isolation.DetectFilesystem(context.Background(), *bwrapPath, parseVolumes(*volumesFlag))
+		if probe.Tier != bwrap.TierFilesystem {
+			log.Error("filesystem isolation unavailable", "reason", probe.Reason)
+			os.Exit(1)
+		}
+	} else {
+		probe = isolation.Detect(context.Background(), *bwrapPath)
+	}
 	if *tierOverride != "" {
 		probe.Tier = bwrap.Tier(*tierOverride)
 		probe.Reason = "overridden on the command line"
@@ -82,6 +115,16 @@ func main() {
 		UID:      1000,
 		GID:      1000,
 	}, probe, token)
+
+	// In filesystem mode the sandbox shares this container's PID namespace, so
+	// execd is the PID 1 that inherits whatever jdix-init does not adopt. It
+	// has to reap, or a sandbox that never expires fills the process table and
+	// nothing in it can fork any more (DESIGN §06).
+	if r := srv.Reaper(); r != nil {
+		stopReaper := make(chan struct{})
+		go r.Run(stopReaper)
+		defer close(stopReaper)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()

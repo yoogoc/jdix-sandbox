@@ -84,7 +84,7 @@ func newFixture(t *testing.T) *fixture {
 
 	f := &fixture{t: t, layout: layout, ws: layout.WorkspaceDir, expired: make(chan string, 1)}
 
-	launcher := func(ctx context.Context, argv []string) (*exec.Cmd, error) {
+	launcher := func(ctx context.Context, argv []string, files []*os.File) (*exec.Cmd, error) {
 		inner := argv
 		for i, a := range argv {
 			if a == "--" {

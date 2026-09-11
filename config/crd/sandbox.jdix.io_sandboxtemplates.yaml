@@ -84,6 +84,13 @@ spec:
                         type: string
                     type: object
                 type: object
+              filesystemIsolation:
+                description: |-
+                  FilesystemIsolation selects directory isolation independently of Pod user
+                  namespaces. It is mutually exclusive with the legacy MinIsolationTier.
+                enum:
+                - bwrap
+                type: string
               image:
                 description: ImageSpec names the sandbox image.
                 properties:
@@ -158,7 +165,6 @@ spec:
                 minimum: -1
                 type: integer
               minIsolationTier:
-                default: userns
                 description: |-
                   MinIsolationTier is a floor, never a preference: a node that measures
                   below it is not used, even if that means a cold start or a failure.
@@ -167,6 +173,7 @@ spec:
                 - userns
                 - capadmin
                 - chroot
+                - filesystem
                 type: string
               network:
                 description: NetworkSpec is the template's egress posture.
@@ -206,6 +213,11 @@ spec:
                   in the controller, which has to re-apply the security fields regardless.
                 type: object
                 x-kubernetes-preserve-unknown-fields: true
+              podUserNamespace:
+                description: |-
+                  PodUserNamespace opts the filesystem mode into Pod UID mapping. Defaults
+                  to false for bwrap; NFS requires false. Legacy templates retain their policy.
+                type: boolean
               resources:
                 description: |-
                   Resources is what one sandbox Pod requests and is limited to. Warm Pods

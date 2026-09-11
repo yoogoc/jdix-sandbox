@@ -146,6 +146,13 @@ func (p Policy) Validate(spec api.FilesystemSpec, l Layout) error {
 		}
 		seen[m.Path] = true
 
+		if p.Tier == TierFilesystem {
+			for j := 0; j < i; j++ {
+				if overlaps(m.Path, spec.Mounts[j].Path) {
+					return verr(field, m.Path, "nested mount targets are not supported in filesystem mode")
+				}
+			}
+		}
 		for _, prot := range p.protectedTargets(l) {
 			if overlaps(m.Path, prot) {
 				return verr(field, m.Path, "overlaps platform path "+prot)

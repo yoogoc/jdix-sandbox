@@ -150,6 +150,10 @@ Temporary Items
 # Build output. `make build` writes here; nothing in it belongs in the repo.
 bin/
 
+# Machine-specific scratch: manifests carrying this laptop's node IP, cluster
+# names and hand-seeded data. hack/dev/ holds what is meant to be shared.
+local/
+
 # Python bytecode from the SDK's test runs
 __pycache__/
 *.pyc

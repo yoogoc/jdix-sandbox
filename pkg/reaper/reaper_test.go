@@ -1,4 +1,4 @@
-package initd
+package reaper
 
 import (
 	"os/exec"
@@ -85,4 +85,41 @@ func TestReaperCollectsOrphans(t *testing.T) {
 	}
 	time.Sleep(500 * time.Millisecond)
 	r.reap() // must be safe to call with nothing left to collect
+}
+
+// pending exists for one narrow race, not as storage. jdix-init is the
+// subreaper for everything a sandbox starts, and a sandbox that never expires
+// starts them indefinitely — an unbounded map would leak with no symptom until
+// the Pod is OOM-killed.
+func TestPendingStatusesAreBounded(t *testing.T) {
+	r := NewReaper()
+	for pid := 1000; pid < 1000+maxPending*3; pid++ {
+		r.deliver(pid, 0)
+	}
+	r.mu.Lock()
+	n, ordered := len(r.pending), len(r.order)
+	r.mu.Unlock()
+	if n > maxPending || ordered > maxPending {
+		t.Fatalf("pending=%d order=%d, want at most %d", n, ordered, maxPending)
+	}
+	// The oldest are the ones dropped; the most recent must still be claimable,
+	// because those are the ones a caller could still be racing to Adopt.
+	if got := r.Wait(1000 + maxPending*3 - 1); got != 0 {
+		t.Errorf("the newest status was evicted: got %d", got)
+	}
+}
+
+// A claimed status must give up its slot, or claimed pids would go on occupying
+// room in the ring and evict statuses that are still wanted.
+func TestClaimingAStatusFreesItsSlot(t *testing.T) {
+	r := NewReaper()
+	r.deliver(4242, 7)
+	if got := r.Wait(4242); got != 7 {
+		t.Fatalf("Wait = %d, want 7", got)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.pending) != 0 || len(r.order) != 0 {
+		t.Errorf("claimed status left behind: pending=%v order=%v", r.pending, r.order)
+	}
 }

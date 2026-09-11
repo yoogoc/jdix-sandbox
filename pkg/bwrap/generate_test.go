@@ -186,3 +186,85 @@ func FuzzGenerate(f *testing.F) {
 		}
 	})
 }
+
+// Filesystem mode is a distinct capability, not a rung on the legacy ladder:
+// it keeps the user namespace that makes unprivileged mounts possible and drops
+// the PID namespace that forced procMount=Unmasked, which forced
+// hostUsers=false, which made the runtime idmap every volume and put NFS out of
+// reach (docs/NFS-CSI-FILESYSTEM-ISOLATION.md §2).
+func TestFilesystemModeArgv(t *testing.T) {
+	l := DefaultLayout()
+	p := DefaultPolicy(TierFilesystem)
+	p.Volumes = map[string]string{"corpus": "/var/lib/jdix/vol/corpus"}
+	p.IsDirFunc = func(string) bool { return false }
+	p.SourceFDs = map[string]int{"/data": 3}
+
+	argv, err := Generate(api.FilesystemSpec{
+		Workspace: api.Workspace{Path: "/workspace"},
+		Mounts: []api.Mount{{
+			Path: "/data", Source: api.MountSource{Volume: "corpus", SubPath: "tenant-a"}, ReadOnly: true,
+		}},
+	}, p, l)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(argv, " ")
+
+	for _, want := range []string{
+		"--unshare-user",        // mounts without privilege still need this
+		"--ro-bind /proc /proc", // the container's masked procfs, not a fresh one
+		"--ro-bind-fd 3 /data",  // the pinned directory, never a re-walked path
+		"--cap-drop ALL",
+		"--subreaper", // jdix-init is no longer PID 1 and must adopt explicitly
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("argv is missing %q:\n  %s", want, joined)
+		}
+	}
+	for _, unwanted := range []string{"--unshare-pid", "--as-pid-1", "--proc /proc", "--unshare-uts"} {
+		if strings.Contains(joined, unwanted) {
+			t.Errorf("argv still carries %q, which is what forced hostUsers=false:\n  %s", unwanted, joined)
+		}
+	}
+}
+
+// A mount whose source was never pinned must fail rather than silently fall
+// back to path resolution, which a concurrent rename on NFS can redirect.
+func TestFilesystemModeRefusesAnUnpinnedSource(t *testing.T) {
+	l := DefaultLayout()
+	p := DefaultPolicy(TierFilesystem)
+	p.Volumes = map[string]string{"corpus": "/var/lib/jdix/vol/corpus"}
+	p.IsDirFunc = func(string) bool { return false }
+
+	_, err := Generate(api.FilesystemSpec{
+		Workspace: api.Workspace{Path: "/workspace"},
+		Mounts:    []api.Mount{{Path: "/data", Source: api.MountSource{Volume: "corpus"}}},
+	}, p, l)
+	if err == nil || !strings.Contains(err.Error(), "pinned") {
+		t.Fatalf("err = %v, want a refusal naming the unpinned source", err)
+	}
+}
+
+// The legacy tiers are a ladder; filesystem mode is beside it. Treating it as a
+// rank would let a node measuring "userns" satisfy a template asking for the
+// new mode, or the reverse — either way a silent substitution of one isolation
+// model for another.
+func TestFilesystemTierIsNotComparableWithTheLadder(t *testing.T) {
+	cases := []struct {
+		have, min Tier
+		want      bool
+	}{
+		{TierFilesystem, TierFilesystem, true},
+		{TierFilesystem, TierUserns, false},
+		{TierUserns, TierFilesystem, false},
+		{TierChroot, TierFilesystem, false},
+		// the ladder itself is unchanged
+		{TierUserns, TierChroot, true},
+		{TierChroot, TierUserns, false},
+	}
+	for _, tc := range cases {
+		if got := tc.have.AtLeast(tc.min); got != tc.want {
+			t.Errorf("Tier(%q).AtLeast(%q) = %v, want %v", tc.have, tc.min, got, tc.want)
+		}
+	}
+}

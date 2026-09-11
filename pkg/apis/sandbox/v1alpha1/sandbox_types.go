@@ -5,13 +5,14 @@ import (
 )
 
 // IsolationTier is how strongly a node can separate the sandbox from the Pod.
-// +kubebuilder:validation:Enum=userns;capadmin;chroot
+// +kubebuilder:validation:Enum=userns;capadmin;chroot;filesystem
 type IsolationTier string
 
 const (
-	TierUserns   IsolationTier = "userns"
-	TierCapAdmin IsolationTier = "capadmin"
-	TierChroot   IsolationTier = "chroot"
+	TierFilesystem IsolationTier = "filesystem"
+	TierUserns     IsolationTier = "userns"
+	TierCapAdmin   IsolationTier = "capadmin"
+	TierChroot     IsolationTier = "chroot"
 )
 
 // SandboxPhase tracks a Sandbox through its life.

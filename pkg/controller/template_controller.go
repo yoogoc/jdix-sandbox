@@ -265,6 +265,13 @@ func (r *TemplateReconciler) resolveImage(ctx context.Context, tpl *sbxv1.Sandbo
 // the tenant that they cannot even do until after a push. The tag is resolved
 // once, in resolveImage, and pinned from then on.
 func (r *TemplateReconciler) staticAdmit(tpl *sbxv1.SandboxTemplate) (sbxv1.AdmissionState, string) {
+	if tpl.Spec.FilesystemIsolation != "" {
+		if tpl.Spec.FilesystemIsolation != "bwrap" || tpl.Spec.MinIsolationTier != "" {
+			return sbxv1.AdmissionRejected, "filesystemIsolation=bwrap must not be combined with minIsolationTier"
+		}
+	} else if tpl.Spec.PodUserNamespace != nil || tpl.Spec.MinIsolationTier == sbxv1.TierFilesystem {
+		return sbxv1.AdmissionRejected, "podUserNamespace requires filesystemIsolation=bwrap; filesystem is not a legacy minIsolationTier"
+	}
 	ref := tpl.Spec.Image.Ref
 	if ref == "" {
 		return sbxv1.AdmissionRejected, "spec.image.ref is required"

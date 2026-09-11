@@ -142,7 +142,8 @@ func buildPodSpec(t *sbxv1.SandboxTemplate, platform PlatformImage, l bwrap.Layo
 	// Templates that do not ask for the userns tier keep RuntimeDefault and get
 	// the weaker chroot tier; nothing is relaxed for a workload that cannot use
 	// it.
-	wantsUserns := t.Spec.MinIsolationTier == sbxv1.TierUserns
+	filesystemMode := t.Spec.FilesystemIsolation == "bwrap"
+	wantsUserns := !filesystemMode && t.Spec.RequiredIsolation() == sbxv1.TierUserns
 	seccomp := corev1.SeccompProfileTypeRuntimeDefault
 	if wantsUserns {
 		seccomp = corev1.SeccompProfileTypeUnconfined
@@ -240,6 +241,15 @@ func buildPodSpec(t *sbxv1.SandboxTemplate, platform PlatformImage, l bwrap.Layo
 	}
 	if wantsUserns {
 		spec.HostUsers = ptr(false)
+	}
+	if filesystemMode {
+		spec.HostUsers = ptr(true)
+		if t.Spec.PodUserNamespace != nil {
+			spec.HostUsers = ptr(!*t.Spec.PodUserNamespace)
+		}
+		profile := "jdix/bwrap-setup.json"
+		spec.SecurityContext.SeccompProfile = &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeLocalhost, LocalhostProfile: &profile}
+		spec.Containers[0].Args = append(spec.Containers[0].Args, "--filesystem-isolation=bwrap")
 	}
 
 	if t.Spec.Image.PullSecretRef != nil {
