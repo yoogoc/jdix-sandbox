@@ -585,6 +585,10 @@ func TestTTLFor(t *testing.T) {
 		// A template that caps lifetimes caps this too: the tenant asked for as
 		// long as possible, and the cap is as long as possible.
 		{"permanent against a cap", sbx(-1), tpl(1800, 14400), 14400 * time.Second},
+		// -1 reads as "no limit" on the other two TTL fields, so it has to mean
+		// the same here rather than being a validation error one field over.
+		{"cap lifted with -1", sbx(-1), tpl(1800, -1), 0},
+		{"cap lifted with -1, finite ask", sbx(600), tpl(1800, -1), 600 * time.Second},
 	}
 	for _, tc := range cases {
 		if got := ttlFor(tc.sbx, tc.tpl); got != tc.want {

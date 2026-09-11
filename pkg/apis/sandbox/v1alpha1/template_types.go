@@ -106,11 +106,15 @@ type SandboxTemplateSpec struct {
 	// +kubebuilder:default=1800
 	// +kubebuilder:validation:Minimum=-1
 	DefaultTTLSeconds int32 `json:"defaultTTLSeconds,omitempty"`
-	// MaxTTLSeconds caps every sandbox from this template. Zero means no cap,
-	// and is therefore also what permits a permanent sandbox: a template that
-	// caps lifetimes caps the permanent ones to the cap as well.
+	// MaxTTLSeconds caps every sandbox from this template, and is therefore
+	// what decides whether this template's sandboxes may outlive their caller:
+	// a template that caps lifetimes caps the permanent ones to the cap too.
+	//
+	// Zero or negative means no cap. Negative is accepted because the two
+	// fields above read -1 as "no limit", and a neighbouring field where the
+	// same value is a validation error is a trap rather than a distinction.
 	// +kubebuilder:default=14400
-	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Minimum=-1
 	MaxTTLSeconds int32 `json:"maxTTLSeconds,omitempty"`
 
 	Image              ImageSpec          `json:"image"`
