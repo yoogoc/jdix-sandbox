@@ -89,7 +89,15 @@ func TestTemplatesWithVolumesWaitForReview(t *testing.T) {
 	tpl := rawTemplate("with-vol", "registry.internal/x@sha256:"+repeat64('a'), func(x *sbxv1.SandboxTemplate) {
 		x.Spec.Volumes = []sbxv1.TemplateVolume{{Name: "corpus", ClaimName: "corpus-rox"}}
 	})
-	c := newFakeClient(t, tpl)
+	// The claim exists and is shareable, so review is the only thing left to
+	// wait for — see TestTemplateWithAnUnshareableVolumeIsRejected for when it
+	// is not.
+	c := newFakeClient(t, tpl, &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "corpus-rox", Namespace: testNS},
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadOnlyMany},
+		},
+	})
 	got := reconcileTemplate(t, c, tpl, "registry.internal")
 	if got.Status.Admission != sbxv1.AdmissionPendingReview {
 		t.Fatalf("admission %q, want PendingReview", got.Status.Admission)
@@ -632,5 +640,65 @@ func TestAnUnpinnedTemplateStillRollsWhenTheTagIsEdited(t *testing.T) {
 
 	if TemplateHash(a, testPlatform(), testLayout()) == TemplateHash(b, testPlatform(), testLayout()) {
 		t.Fatal("editing the tag must change the hash, or a template update would never take effect")
+	}
+}
+
+// A warm pool is several idle Pods holding the same volume at once, which a
+// ReadWriteOnce claim cannot satisfy: it attaches to one node. Catching that at
+// admission is the difference between a clear message and a pool that silently
+// never fills (DESIGN.md §05.4 ①).
+func TestTemplateWithAnUnshareableVolumeIsRejected(t *testing.T) {
+	claim := func(name string, modes ...corev1.PersistentVolumeAccessMode) *corev1.PersistentVolumeClaim {
+		return &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNS},
+			Spec:       corev1.PersistentVolumeClaimSpec{AccessModes: modes},
+		}
+	}
+	cases := []struct {
+		name  string
+		modes []corev1.PersistentVolumeAccessMode
+		want  sbxv1.AdmissionState
+	}{
+		{"rwx", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany}, sbxv1.AdmissionApproved},
+		{"rox", []corev1.PersistentVolumeAccessMode{corev1.ReadOnlyMany}, sbxv1.AdmissionApproved},
+		{"rwo", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce}, sbxv1.AdmissionRejected},
+		// Stricter than RWO, not looser.
+		{"rwop", []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOncePod}, sbxv1.AdmissionRejected},
+		{"rwo alongside rox", []corev1.PersistentVolumeAccessMode{
+			corev1.ReadWriteOnce, corev1.ReadOnlyMany}, sbxv1.AdmissionApproved},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tpl := rawTemplate("tpl-"+tc.name, "registry.internal/jdix/py@sha256:"+repeat64('a'),
+				func(x *sbxv1.SandboxTemplate) {
+					x.Annotations = map[string]string{AnnotationApprovedBy: "someone"}
+					x.Spec.Volumes = []sbxv1.TemplateVolume{{Name: "corpus", ClaimName: "pvc-" + tc.name}}
+				})
+			got := reconcileTemplate(t, newFakeClient(t, tpl, claim("pvc-"+tc.name, tc.modes...)), tpl)
+			if got.Status.Admission != tc.want {
+				t.Fatalf("admission %q (%s), want %q",
+					got.Status.Admission, got.Status.AdmissionReason, tc.want)
+			}
+			if tc.want == sbxv1.AdmissionRejected && !strings.Contains(got.Status.AdmissionReason, "ReadWriteMany") {
+				t.Errorf("the reason does not say what to do instead: %q", got.Status.AdmissionReason)
+			}
+		})
+	}
+}
+
+// Templates and claims are usually applied together, so a claim that is not
+// there yet is a race, not a misconfiguration.
+func TestTemplateWaitsForAMissingClaim(t *testing.T) {
+	tpl := rawTemplate("tpl-noclaim", "registry.internal/jdix/py@sha256:"+repeat64('a'),
+		func(x *sbxv1.SandboxTemplate) {
+			x.Annotations = map[string]string{AnnotationApprovedBy: "someone"}
+			x.Spec.Volumes = []sbxv1.TemplateVolume{{Name: "corpus", ClaimName: "not-created-yet"}}
+		})
+	got := reconcileTemplate(t, newFakeClient(t, tpl), tpl)
+	if got.Status.Admission != sbxv1.AdmissionPending {
+		t.Fatalf("admission %q, want Pending: the claim may still be on its way", got.Status.Admission)
+	}
+	if !strings.Contains(got.Status.AdmissionReason, "not-created-yet") {
+		t.Errorf("the reason does not name the missing claim: %q", got.Status.AdmissionReason)
 	}
 }

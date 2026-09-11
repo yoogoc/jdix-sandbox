@@ -488,8 +488,10 @@ bound Pod 无对应 Sandbox（孤儿）      → delete
 
 预热池里有 N 个 idle Pod，它们必须同时挂同一个卷。RWO 卷同一时刻只能被一个节点挂载，与预热池模型天然冲突。处理方式：
 
-- 模板准入时校验 PVC 的 `accessModes`，含 RWO 且不含 ROX/RWX → 直接拒绝并说明原因。
-- 确有 RWO 需求的模板，强制 `SandboxPool.replicas: 0`（纯冷启动），并在 Console 上标注"此模板不支持预热"。
+- 模板准入时校验 PVC 的 `accessModes`，含 RWO 且不含 ROX/RWX → 直接拒绝并说明原因。**已实现**（`template_controller.go:admitVolumes`）：PVC 不存在按瞬态处理（模板和 PVC 常常一起 apply，按两条 kubectl 的先后顺序判死刑没道理），保持 Pending 并重排；PVC 存在但 accessModes 不含 ROX/RWX → Rejected，理由里写清楚该换成什么。`ReadWriteOncePod` 归入拒绝——它比 RWO 更严，不是更松。
+- 确有 RWO 需求的模板，强制 `SandboxPool.replicas: 0`（纯冷启动），并在 Console 上标注"此模板不支持预热"。**未实现**：目前是直接拒绝，没有留纯冷启动这条路。
+
+> 单节点集群会掩盖这条约束：所有 Pod 都落在挂了卷的那唯一一个节点上，RWO 照样能跑。所以本地验证带卷的模板时，用的 StorageClass 必须真的能给出 RWX，否则会为了错误的理由通过。
 
 **② CSI attach + mount 进入冷启动关键路径，典型 3~30s，个别云盘更久。**
 
@@ -576,7 +578,7 @@ apiserver 创建/更新 `SandboxTemplate` 时同步执行，同时配 Validating
 | 可按模板关闭解析 | `spec.image.resolve: false`——平台连不到 registry 但节点能连、镜像只在本地构建过、气隙环境，这三种情况必须能跳过。此时由 kubelet 按 tag 拉，`status.imagePinned: false` 标明未钉住。**代价要写在字段注释里让人看见**：同一个池里的 Pod 可能跑不同构建（已缓存该 tag 的节点保持旧的，新节点拉新的）；tag 被移动不再滚动池；拼错的镜像名不在准入时暴露，而是变成"每个预热 Pod 都起不来"，读起来像"池填不满"而不是"模板写错了" | P0 |
 | 镜像大小上限 | 默认 5GiB（`--max-image-bytes`），从解析时拿到的 manifest 层大小求和。超大镜像会把冷启动拖到分钟级。已固化 digest 的引用拿不到大小，此时跳过该检查——否则会把唯一能离线工作的路径也堵死 | P0 |
 | 平台路径冲突检查 | 镜像不得在 `/opt/jdix`、`/var/lib/jdix` 放东西（initContainer 会覆盖，但要提前报错而非运行时诡异失败） | P0 |
-| **卷 accessModes 校验** | 见 §05.4 ①，含 RWO 直接拒绝或强制 `replicas: 0` | P0 |
+| ~~**卷 accessModes 校验**~~ | 见 §05.4 ①，含 RWO 直接拒绝 | ✅ 已完成 |
 | **带卷模板转人工审批** | 见 §05.4 ③ | P0 |
 | 必需二进制检查 | 镜像内需有 `/bin/sh`；缺失则所有 exec 失败 | P1 |
 | Cosign 签名校验 | 租户可选开启，开启后拒绝未签名镜像 | P1 |

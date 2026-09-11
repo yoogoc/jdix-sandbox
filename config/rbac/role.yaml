@@ -7,6 +7,15 @@ rules:
 - apiGroups:
   - ""
   resources:
+  - persistentvolumeclaims
+  - secrets
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
   - pods
   verbs:
   - create
@@ -23,14 +32,6 @@ rules:
   verbs:
   - create
   - get
-- apiGroups:
-  - ""
-  resources:
-  - secrets
-  verbs:
-  - get
-  - list
-  - watch
 - apiGroups:
   - sandbox.jdix.io
   resources:

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -67,6 +68,7 @@ func (r *TemplateReconciler) now() time.Time {
 	return time.Now()
 }
 
+// +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch
 // +kubebuilder:rbac:groups=sandbox.jdix.io,resources=sandboxtemplates,verbs=get;list;watch
 // +kubebuilder:rbac:groups=sandbox.jdix.io,resources=sandboxtemplates/status,verbs=get;update;patch
 // Reading imagePullSecrets is what lets a template resolve the same image its
@@ -107,7 +109,67 @@ func (r *TemplateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 
 	state, reason := r.resolvedAdmit(&tpl)
+	// Only once a human has signed off is there any point examining the claim.
+	// A template awaiting review should say so, rather than reporting a problem
+	// with storage nobody has agreed to pay for yet.
+	if state == sbxv1.AdmissionApproved {
+		var requeue time.Duration
+		state, reason, requeue = r.admitVolumes(ctx, &tpl)
+		if requeue > 0 {
+			if err := r.publish(ctx, &tpl, state, reason); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{RequeueAfter: requeue}, nil
+		}
+	}
 	return ctrl.Result{}, r.publish(ctx, &tpl, state, reason)
+}
+
+// admitVolumes checks that every declared volume can be mounted by a warm pool.
+//
+// A warm pool is N idle Pods holding the same volume at the same time, and a
+// ReadWriteOnce claim can only be attached to one node — so an RWO volume and a
+// warm pool are mutually exclusive by construction, not by policy (DESIGN.md
+// §05.4 ①). Left unchecked it fails much later and much less clearly: the pool
+// simply never reaches its replica count, or quietly pins every sandbox for
+// that template onto whichever node attached the volume first.
+//
+// A missing claim is treated as transient rather than fatal. Templates and
+// claims are often applied together, and rejecting on the ordering of two
+// kubectl invocations would be its own kind of puzzle.
+func (r *TemplateReconciler) admitVolumes(ctx context.Context, tpl *sbxv1.SandboxTemplate) (sbxv1.AdmissionState, string, time.Duration) {
+	for _, v := range tpl.Spec.Volumes {
+		var pvc corev1.PersistentVolumeClaim
+		key := client.ObjectKey{Namespace: tpl.Namespace, Name: v.ClaimName}
+		if err := r.Get(ctx, key, &pvc); err != nil {
+			if apierrors.IsNotFound(err) {
+				return sbxv1.AdmissionPending, fmt.Sprintf(
+					"volume %q references PersistentVolumeClaim %q, which does not exist in namespace %s yet",
+					v.Name, v.ClaimName, tpl.Namespace), 15 * time.Second
+			}
+			return sbxv1.AdmissionPending, fmt.Sprintf(
+				"reading PersistentVolumeClaim %q: %v", v.ClaimName, err), 15 * time.Second
+		}
+		if !shareable(pvc.Spec.AccessModes) {
+			return sbxv1.AdmissionRejected, fmt.Sprintf(
+				"volume %q claims %q, whose access modes are %v: a warm pool holds several Pods on the same volume at once, "+
+					"so it needs ReadOnlyMany or ReadWriteMany. Use a claim that provides one, or drop the volume from this template",
+				v.Name, v.ClaimName, pvc.Spec.AccessModes), 0
+		}
+	}
+	return sbxv1.AdmissionApproved, "", 0
+}
+
+// shareable reports whether a claim can be held by several Pods at once.
+// ReadWriteOncePod is deliberately not in the list: it is stricter than RWO,
+// not looser.
+func shareable(modes []corev1.PersistentVolumeAccessMode) bool {
+	for _, m := range modes {
+		if m == corev1.ReadOnlyMany || m == corev1.ReadWriteMany {
+			return true
+		}
+	}
+	return false
 }
 
 // publish writes status only when something actually changed, so a template
